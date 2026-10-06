@@ -1,0 +1,14 @@
+{
+  "name": "cookie-sync-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cookie Sync 接收端：接收油猴脚本推送的浏览器 Cookie",
+  "main": "receiver.js",
+  "scripts": {
+    "start": "node receiver.js",
+    "dev": "node receiver.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

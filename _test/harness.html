@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Cookie Sync · 测试台</title>
+  <style>
+    body { background:#f8fafc; color:#0f172a; font-family: system-ui, "Microsoft YaHei", sans-serif; padding:40px; margin:0; }
+    .box { max-width:640px; margin:0 auto; background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:24px; }
+    h1 { font-size:20px; margin:0 0 12px; }
+    code { background:#f1f5f9; padding:1px 5px; border-radius:4px; }
+    label { display:block; margin:10px 0 4px; color:#475569; font-size:13px; }
+    input { display:block; margin:0 0 12px; padding:8px; width:100%; box-sizing:border-box;
+            border:1px solid #cbd5e1; border-radius:6px; }
+    #status { margin-top:16px; padding:12px; border-radius:8px; background:#0f172a; color:#e2e8f0;
+              font-family: ui-monospace, Consolas, monospace; font-size:12px; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Cookie Sync 测试台</h1>
+    <p>桩掉油猴 API，验证：悬浮浮漂能否挂载、点击后是否有可见反馈。</p>
+
+    <label>账号（测试「填入」用）</label>
+    <input id="u" type="text" placeholder="user">
+    <label>密码（测试「填入」用）</label>
+    <input id="p" type="password" placeholder="password">
+
+    <div id="status">waiting…</div>
+  </div>
+
+  <script>
+    // ---------- 模拟油猴 API ----------
+    const store = {};
+    if (location.search.indexOf('nourl') < 0) {
+      store['cs_server_url'] = 'http://127.0.0.1:8899/api/cookies'; // 预置，便于走通导出流程
+    }
+    window.GM_getValue = (k, d) => (k in store ? store[k] : d);
+    window.GM_setValue = (k, v) => { store[k] = v; };
+    window.GM_deleteValue = (k) => { delete store[k]; };
+    window.GM_registerMenuCommand = (name) => console.log('[harness] menu:', name);
+    window.GM_notification = (o) => console.log('[harness] notification:', o);
+    window.GM_xmlhttpRequest = (o) => {
+      console.log('[harness] XHR ->', o.method, o.url);
+      window.__lastXhr = { url: o.url, data: o.data };
+      setTimeout(() => o.onload && o.onload({ status: 200, responseText: '{"ok":true,"received":2}' }), 150);
+    };
+    // 不定义 GM_cookie，走 document.cookie 回退分支
+    document.cookie = 'harness_a=1';
+    document.cookie = 'harness_b=2';
+
+    window.__log = [];
+    const origLog = console.log;
+    console.log = (...a) => { window.__log.push(a.map(String).join(' ')); origLog(...a); };
+  </script>
+  <script src="../cookie-sync.user.js"></script>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const lines = [];
+    const say = (s) => { lines.push(s); statusEl.textContent = lines.join('\n'); };
+
+    // 模拟真实点击（派发 pointer 事件，因为浮漂用 pointerdown/up 处理拖拽与开合）
+    function realClick(el) {
+      const r = el.getBoundingClientRect();
+      const o = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2,
+                  clientY: r.top + r.height / 2, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      el.dispatchEvent(new PointerEvent('pointerdown', o));
+      el.dispatchEvent(new PointerEvent('pointerup', o));
+    }
+
+    const params = new URLSearchParams(location.search);
+    const auto = params.get('auto') === '1';
+
+    let tries = 0;
+    const timer = setInterval(() => {
+      tries++;
+      const host = document.getElementById('cookie-sync-host');
+      if (!host || !host.shadowRoot) {
+        if (tries > 50) { clearInterval(timer); say('❌ 浮漂未挂载（host 或 shadowRoot 缺失）'); }
+        return;
+      }
+      clearInterval(timer);
+      say('✅ 浮漂浮层已挂载 #cookie-sync-host');
+      say('   位置: ' + host.style.left + ',' + host.style.top + ' (right=' + host.style.right + ')');
+
+      const sr = host.shadowRoot;
+      const ball = sr.querySelector('.btn');
+      say('✅ 浮漂按钮存在: ' + !!ball);
+
+      if (params.get('drag') === '1') {
+        // 模拟拖拽：应只移动，不打开面板
+        const before = host.getBoundingClientRect();
+        const b = ball.getBoundingClientRect();
+        const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
+        const o = { bubbles: true, cancelable: true, pointerId: 2, pointerType: 'mouse', isPrimary: true };
+        ball.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ clientX: cx, clientY: cy }, o)));
+        ball.dispatchEvent(new PointerEvent('pointermove', Object.assign({ clientX: cx - 200, clientY: cy - 160 }, o)));
+        ball.dispatchEvent(new PointerEvent('pointerup', Object.assign({ clientX: cx - 200, clientY: cy - 160 }, o)));
+        const after = host.getBoundingClientRect();
+        say('--- 拖拽测试 ---');
+        say('拖动前位置: ' + Math.round(before.left) + ',' + Math.round(before.top));
+        say('拖动后位置: ' + Math.round(after.left) + ',' + Math.round(after.top));
+        say('位移正确: ' + (Math.abs(after.left - (before.left - 200)) < 3 && Math.abs(after.top - (before.top - 160)) < 3));
+        say('拖拽未误开面板: ' + !sr.querySelector('.panel').classList.contains('open'));
+        say('位置已持久化: ' + !!store['cs_pos']);
+        return;
+      }
+
+      if (!auto) return;
+
+      // 1) 打开面板
+      realClick(ball);
+      const panelOpen = sr.querySelector('.panel').classList.contains('open');
+      say('✅ 点击浮漂 -> 面板打开: ' + panelOpen);
+
+      // 2) 读取面板里的服务器地址
+      say('   面板内地址: ' + sr.querySelector('#url').value);
+
+      // 3) 点击「立即导出」
+      setTimeout(() => {
+        const now = sr.querySelector('#now');
+        say('✅ 点击「立即导出」…');
+        now.click();
+      }, 150);
+    }, 100);
+
+    // 自动模式下，最后把结果汇总
+    if (auto) {
+      setTimeout(() => {
+        const th = document.getElementById('cookie-sync-toast-host');
+        let t = '';
+        if (th && th.shadowRoot) {
+          const items = th.shadowRoot.querySelectorAll('.t');
+          t = Array.from(items).map((x) => x.textContent).join(' | ');
+        }
+        say('--- 结果 ---');
+        say('toast 容器存在: ' + !!th);
+        say('页面级提示(toast): ' + (t || '(无)'));
+        say('XHR 请求: ' + (window.__lastXhr ? window.__lastXhr.url : '(无)'));
+        say('--- 脚本内部日志 ---');
+        window.__log.filter((l) => l.indexOf('[Cookie Sync]') >= 0).forEach((l) => say(l));
+        window.__finalStatus = lines.join('\n');
+      }, 1200);
+    }
+  </script>
+</body>
+</html>

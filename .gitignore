@@ -1,0 +1,12 @@
+# 依赖 / 日志
+node_modules/
+*.log
+
+# 环境变量（含鉴权 TOKEN，切勿提交）
+.env
+*.env
+!*.env.example
+
+# 接收到的 Cookie 数据（含凭据，切勿提交）
+server/data/*
+!server/data/.gitkeep
