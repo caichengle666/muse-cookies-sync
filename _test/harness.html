@@ -42,6 +42,45 @@
       window.__menu[name] = fn;
       console.log('[harness] menu:', name);
     };
+
+    // ---- 模拟 GM_cookie：故意用 url/domain 两种过滤返回不同子集，验证合并逻辑 ----
+    // 注意：{url} 查询按 path 过滤（模拟浏览器真实行为），走 path 分支的 Cookie 只在 domain 查询里出现
+    const ALL_COOKIES = [
+      { name: 'sid', value: 'abc123', domain: '.test.example.com', path: '/', secure: true,
+        httpOnly: true, hostOnly: false, session: false, expirationDate: 1893456000,
+        sameSite: 'lax', storeId: '0' },
+      { name: 'path_scoped', value: 'p1', domain: 'test.example.com', path: '/admin', secure: true,
+        httpOnly: false, hostOnly: false, session: true, expirationDate: null,
+        sameSite: 'no_restriction', storeId: '0' },
+      { name: 'hostonly', value: 'h1', domain: 'www.test.example.com', path: '/', secure: false,
+        httpOnly: false, hostOnly: true, session: true, expirationDate: null,
+        sameSite: 'unspecified', storeId: '0' },
+    ];
+    window.__ALL_COOKIES = ALL_COOKIES;
+
+    const probeEarly = new URLSearchParams(location.search).get('probe');
+    if (probeEarly !== 'cookie-fallback') {
+      window.GM_cookie = {
+        list(details, cb) {
+          let out = ALL_COOKIES;
+          if (details.url) {
+            // 模拟：只返回该 URL 会收到的 Cookie（按 path 过滤，所以 /admin 那条不出现）
+            out = ALL_COOKIES.filter((c) => c.path === '/');
+          } else if (details.domain) {
+            out = ALL_COOKIES.filter((c) => {
+              const d = String(c.domain || '').replace(/^\./, '');
+              return d === details.domain || d.endsWith('.' + details.domain);
+            });
+          }
+          console.log('[harness] GM_cookie.list', JSON.stringify(details), '->', out.length);
+          setTimeout(() => cb(out, null), 20);
+        },
+      };
+    } else {
+      // 回退路径：没有 GM_cookie，只有 document.cookie
+      document.cookie = 'fallback_a=1';
+      document.cookie = 'fallback_b=2';
+    }
     window.GM_notification = (o) => console.log('[harness] notification:', o);
     window.GM_xmlhttpRequest = (o) => {
       console.log('[harness] XHR ->', o.method, o.url);
@@ -138,6 +177,48 @@
           toggleFn();
           say('菜单「显示/隐藏浮漂」后 display: "' + host.style.display + '"，可见: ' + (host.style.display !== 'none'));
         }
+        return;
+      }
+
+      if (params.get('probe')) {
+        const probe = params.get('probe');
+        say('--- Cookie 采集测试：' + probe + ' ---');
+        say('hostname : ' + location.hostname);
+
+        sr.querySelector('#now').click();
+
+        setTimeout(() => {
+          const x = window.__lastXhr;
+          if (!x) { say('❌ 没有发出请求'); window.__finalStatus = lines.join('\n'); return; }
+          const p = JSON.parse(x.data);
+          const FIELDS = ['name','value','domain','path','secure','httpOnly','hostOnly',
+                          'session','expirationDate','sameSite','storeId'];
+          const c0 = p.cookies[0] || {};
+          const missing = FIELDS.filter((f) => !(f in c0));
+
+          say('source        : ' + p.source);
+          say('sources       : ' + JSON.stringify(p.sources));
+          say('count         : ' + p.count);
+          say('fieldComplete : ' + p.fieldComplete);
+          say('warnings      : ' + (p.warnings && p.warnings.length ? p.warnings.length + ' 条' : '无'));
+          say('cookies       : ' + p.cookies.map((c) => c.name + '@' + c.domain + c.path).join(' , '));
+          say('第1条缺字段    : ' + (missing.length ? missing.join(',') : '(无)'));
+
+          if (probe === 'cookie-merge') {
+            say('含 path_scoped : ' + p.cookies.some((c) => c.name === 'path_scoped')
+                + '   ← 旧版会漏（{url} 按 path 过滤）');
+            say('含父域 sid     : ' + p.cookies.some((c) => c.name === 'sid' && c.domain === '.test.example.com'));
+            const keys = p.cookies.map((c) => c.name + '|' + c.domain + '|' + c.path);
+            say('无重复         : ' + (new Set(keys).size === keys.length));
+          }
+          if (probe === 'cookie-fallback') {
+            say('hostOnly→null  : ' + (c0.hostOnly === null) + '   ← 不再猜');
+            say('session→null   : ' + (c0.session === null) + '   ← 不再猜');
+            say('expirationDate : ' + (c0.expirationDate === null));
+            say('inferred 标记  : ' + (c0.inferred === true));
+          }
+          window.__finalStatus = lines.join('\n');
+        }, 400);
         return;
       }
 

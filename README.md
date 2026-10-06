@@ -177,21 +177,80 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 因此：
 
 - 想导出**登录态等 HttpOnly Cookie**，必须允许 Tampermonkey 的 `GM_cookie` 权限；
-- 若只显示少量 Cookie，通常是权限未授予或该站 Cookie 多为 HttpOnly。
+- 若只显示少量 Cookie，通常是权限未授予、或该站 Cookie 多为 HttpOnly。
+
+### 覆盖范围：多次查询合并，不是「取到就停」
+
+`GM_cookie.list({ url })` 只返回**会发给当前 URL** 的 Cookie——它按 `path` 过滤，
+所以 `path=/admin`、`path=/api` 这类会被漏掉；被上级域（`.example.com`）设置的 Cookie
+也不在 `{ domain: www.example.com }` 的结果里。
+
+所以脚本会把这些查询**全部执行并合并去重**：
+
+```
+{ url: 当前地址 }
+{ domain: www.example.com }     ← 逐级向上（最多 4 级；IP 地址不做父域推断）
+{ domain: example.com }
+```
+
+去重键是 `name + domain + path + partitionKey`——同名 Cookie 若归属域或 path 不同，
+本就是两条不同的 Cookie，都会保留。
+
+payload 里的 `sources` 会记录每次查询各命中多少条，排查「为什么少了」时先看它。
+
+### 字段集：拿不到就置 null，不猜
+
+每条 Cookie 统一为下列字段（对齐浏览器 `cookies.Cookie`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` / `value` | 名称与值（**原样保留，不解码**——服务端常自己做过编码，解了反而毁值） |
+| `domain` / `path` | 归属域与路径 |
+| `secure` / `httpOnly` | 是否仅 HTTPS、是否脚本不可读 |
+| `hostOnly` | `true` = 仅本主机，不发给子域 |
+| `session` | `true` = 会话 Cookie（无过期时间） |
+| `expirationDate` | Unix 秒级时间戳；会话 Cookie 为 `null` |
+| `sameSite` | `lax` / `strict` / `no_restriction` / `unspecified` |
+| `partitionKey` | CHIPS 分区键（存在时才有） |
+
+**关键：拿不到的字段一律 `null`，绝不替浏览器猜。** 猜错的 `secure` / `hostOnly` / `session`
+会让用起来的 Cookie 行为不对——比如该只发主机的却发给了子域，或把持久 Cookie 当会话 Cookie
+（重启浏览器就失效）。
+
+> ⚠️ **回退时的字段缺失**
+> `GM_cookie` 未授权时只能退回 `document.cookie`，而它**只有 `name` / `value`**。
+> 此时 `expirationDate`、`sameSite`、`hostOnly`、`session`、`storeId` 全为 `null`，
+> `domain` / `path` / `secure` 是按当前页面**推断**的，这些条目标了 `inferred: true`。
+> payload 的 `fieldComplete` 为 `false`，`warnings` 列出缺哪些，面板另弹红色提示。
 
 推送的 payload 结构：
 
 ```json
 {
-  "site": "example.com",
-  "url": "https://example.com/page",
+  "site": "www.example.com",
+  "url": "https://www.example.com/page",
   "title": "页面标题",
-  "source": "GM_cookie(url)",
+  "source": "GM_cookie",
+  "sources": ["GM_cookie(url)=2", "GM_cookie(domain:www.example.com)=1", "GM_cookie(domain:example.com)=3"],
+  "fieldComplete": true,
+  "warnings": [],
   "ua": "Mozilla/5.0 ...",
   "exportedAt": "2026-10-06T05:56:24.000Z",
   "count": 3,
   "cookies": [
-    { "name": "session", "value": "...", "domain": "example.com", "path": "/", "httpOnly": true }
+    {
+      "name": "sid",
+      "value": "abc123",
+      "domain": ".example.com",
+      "path": "/",
+      "secure": true,
+      "httpOnly": true,
+      "hostOnly": false,
+      "session": false,
+      "expirationDate": 1893456000,
+      "sameSite": "lax",
+      "storeId": "0"
+    }
   ]
 }
 ```
@@ -272,6 +331,12 @@ python -m http.server 8899
 #   http://127.0.0.1:8899/_test/harness.html?auto=1&nourl=1  （验证未配置地址的报错）
 #   http://127.0.0.1:8899/_test/harness.html?drag=1     （验证拖拽）
 #   http://127.0.0.1:8899/_test/harness.html?toggle=1   （验证浮漂显隐开关）
+#   http://127.0.0.1:8899/_test/harness.html?probe=cookie-merge     （验证多域合并去重、字段齐全）
+#   http://127.0.0.1:8899/_test/harness.html?probe=cookie-fallback  （验证 document.cookie 回退的字段缺失标记）
+#
+# 注：cookie-merge 用例需要多级域名，可用 Chrome 的 host 映射打开：
+#   chrome --host-resolver-rules="MAP www.test.example.com 127.0.0.1" \
+#          "http://www.test.example.com:8899/_test/harness.html?probe=cookie-merge"
 ```
 
 `_test/preview-*.png` 是自测截图留档。

@@ -2,8 +2,8 @@
 // @name         Cookie Sync · Cookie 同步 & 个人凭据保险箱
 // @name:zh-CN   Cookie 同步 / 个人凭据保险箱
 // @namespace    local.cookie.sync
-// @version      1.3.0
-// @description  个人工具：导出当前站点 Cookie；维护「你自己账号」的登录凭据并可一键填入登录表单，可选同步到你的鉴权服务器；支持隐藏页面浮漂
+// @version      1.4.0
+// @description  个人工具：导出当前站点 Cookie（统一字段、多域合并去重）；维护「你自己账号」的登录凭据并可一键填入登录表单，可选同步到你的鉴权服务器；支持隐藏页面浮漂
 // @author       you
 // @match        http://*/*
 // @match        https://*/*
@@ -79,23 +79,77 @@
   // ---------------------------------------------------------------------------
   // Cookie 采集
   // ---------------------------------------------------------------------------
+  // 归一化用的类型助手：拿不到就返回 null，绝不替浏览器做假设
+  const asStr = (v) => (v === undefined || v === null ? null : String(v));
+  const asBool = (v) => (typeof v === 'boolean' ? v : null);
+  const asNum = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+  /**
+   * 归一化成统一字段集（对齐 WebExtensions 的 cookies.Cookie）。
+   *
+   * 原则：**拿不到就置 null，不猜**。猜错的 secure / hostOnly / session
+   * 会让恢复出来的 Cookie 行为不对——例如该只发主机的却发给了子域，
+   * 或把持久 Cookie 当成会话 Cookie（重启浏览器就没了）。
+   */
+  function normalizeCookie(raw) {
+    const m = raw && typeof raw === 'object' ? raw : {};
+    const c = {
+      name: asStr(m.name) || '',
+      value: m.value === undefined || m.value === null ? '' : String(m.value),
+      domain: asStr(m.domain),
+      path: asStr(m.path),
+      secure: asBool(m.secure),
+      httpOnly: asBool(m.httpOnly),
+      hostOnly: asBool(m.hostOnly),
+      session: asBool(m.session),
+      expirationDate: asNum(m.expirationDate),
+      sameSite: asStr(m.sameSite),
+      storeId: asStr(m.storeId),
+    };
+    if (m.partitionKey !== undefined) c.partitionKey = m.partitionKey; // CHIPS 分区键
+    return c;
+  }
+
+  /** 去重键：同名 Cookie 可能因 domain / path / 分区键不同而并存，都要保留 */
+  function cookieKey(c) {
+    return [
+      c.name,
+      c.domain || '',
+      c.path || '',
+      c.partitionKey ? JSON.stringify(c.partitionKey) : '',
+    ].join('|');
+  }
+
+  /**
+   * document.cookie 回退：**只能拿到 name / value**。
+   * 归属域、path、secure、expirationDate、sameSite 等一律无法得知，
+   * 所以标记 inferred，不可知的字段留 null，由消费方自行决定怎么处理。
+   */
   function parseDocumentCookie() {
     if (!document.cookie) return [];
-    return document.cookie.split(';').map((pair) => {
-      const idx = pair.indexOf('=');
-      const name = (idx > -1 ? pair.slice(0, idx) : pair).trim();
-      const value = idx > -1 ? pair.slice(idx + 1).trim() : '';
-      return {
-        name,
-        value,
-        domain: location.hostname,
-        path: '/',
-        secure: location.protocol === 'https:',
-        hostOnly: false,
-        session: true,
-        httpOnly: false,
-      };
-    });
+    return document.cookie
+      .split(';')
+      .map((pair) => {
+        const idx = pair.indexOf('=');
+        const name = (idx > -1 ? pair.slice(0, idx) : pair).trim();
+        if (!name) return null;
+        return {
+          name,
+          // 原样保留：不要 decodeURIComponent——服务端常自己做过编码，解了反而毁值
+          value: idx > -1 ? pair.slice(idx + 1).trim() : '',
+          domain: location.hostname, // 推断值
+          path: '/', // 推断值
+          secure: location.protocol === 'https:', // 推断值
+          httpOnly: false, // 事实：document.cookie 一定看不到 HttpOnly
+          hostOnly: null, // 未知
+          session: null, // 未知
+          expirationDate: null, // 未知
+          sameSite: null, // 未知
+          storeId: null, // 未知
+          inferred: true,
+        };
+      })
+      .filter(Boolean);
   }
 
   function gmCookieList(details) {
@@ -133,20 +187,78 @@
     });
   }
 
-  async function collectCookies() {
-    let cookies = await gmCookieList({ url: location.href });
-    let source = 'GM_cookie(url)';
+  /** 由当前主机名逐级向上列出候选域：www.a.example.com → a.example.com → example.com */
+  function candidateDomains() {
+    const host = location.hostname;
+    if (!host) return [];
+    // IP / IPv6 不做父域推断
+    if (/^\d+(\.\d+){3}$/.test(host) || host.includes(':')) return [];
+    const parts = host.split('.');
+    const out = [];
+    for (let i = 0; i <= parts.length - 2 && out.length < 4; i++) {
+      out.push(parts.slice(i).join('.'));
+    }
+    return out;
+  }
 
-    if (!cookies) {
-      cookies = await gmCookieList({ domain: location.hostname });
-      source = 'GM_cookie(domain)';
+  /**
+   * 采集当前站点 Cookie。
+   *
+   * 关键：GM_cookie.list({ url }) 只返回「会发给这个 URL」的 Cookie（会按 path 过滤），
+   * 所以 path 不是 / 的 Cookie 会漏；而被上级域（如 .example.com）设置的 Cookie
+   * 也不在 { domain: www.example.com } 的结果里。
+   *
+   * 因此这里不是「取到就停」，而是把 {url} 与各级父域 {domain} 的结果**全部合并去重**。
+   */
+  async function collectCookies() {
+    const merged = new Map();
+    const sources = [];
+    let gmUsable = false;
+
+    const queries = [[{ url: location.href }, 'GM_cookie(url)']];
+    for (const d of candidateDomains()) {
+      queries.push([{ domain: d }, `GM_cookie(domain:${d})`]);
     }
-    if (!cookies) {
-      cookies = parseDocumentCookie();
-      source = 'document.cookie';
+
+    for (const [details, tag] of queries) {
+      const list = await gmCookieList(details);
+      if (!list) continue; // 该次查询不可用（API 不存在 / 报错）
+      gmUsable = true;
+      if (list.length) sources.push(`${tag}=${list.length}`);
+      for (const raw of list) {
+        const c = normalizeCookie(raw);
+        const key = cookieKey(c);
+        if (!merged.has(key)) merged.set(key, c); // 同一 Cookie 被多次查到只留一条
+      }
     }
-    dbg(`采集 Cookie：来源=${source}，数量=${(cookies || []).length}`);
-    return { source, cookies: cookies || [] };
+
+    if (gmUsable) {
+      const cookies = Array.from(merged.values()).sort(
+        (a, b) =>
+          (a.domain || '').localeCompare(b.domain || '') ||
+          (a.path || '').localeCompare(b.path || '') ||
+          a.name.localeCompare(b.name)
+      );
+      dbg(`采集 Cookie：查询=${sources.join(', ')}，去重后 ${cookies.length} 条`);
+      return { source: 'GM_cookie', sources, cookies, fieldComplete: true, warnings: [] };
+    }
+
+    // 回退：GM_cookie 未授权 / 不可用
+    const cookies = parseDocumentCookie().sort((a, b) => a.name.localeCompare(b.name));
+    const warnings = [
+      'GM_cookie 未授权或不可用，已回退 document.cookie',
+      'document.cookie 只能读到 name / value：expirationDate、sameSite、hostOnly、session、storeId 均无法获取',
+      'domain / path / secure 是按当前页面推断的值，可能与真实归属不同',
+      'HttpOnly Cookie 无法通过此方式获取——而登录态往往正是 HttpOnly',
+    ];
+    dbg(`采集 Cookie：来源=document.cookie，${cookies.length} 条；字段不完整`);
+    return {
+      source: 'document.cookie',
+      sources: [`document.cookie=${cookies.length}`],
+      cookies,
+      fieldComplete: false,
+      warnings,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -243,16 +355,19 @@
   // ---------------------------------------------------------------------------
   // 功能一：Cookie 导出
   // ---------------------------------------------------------------------------
-  function buildCookiePayload(source, cookies) {
+  function buildCookiePayload(collected) {
     return {
       site: location.hostname,
       url: location.href,
       title: document.title,
-      source,
+      source: collected.source,
+      sources: collected.sources, // 实际命中的查询（含各父域命中条数），便于排查"为什么少了"
+      fieldComplete: collected.fieldComplete, // false = 走了 document.cookie 回退，字段不全
+      warnings: collected.warnings,
       ua: navigator.userAgent,
       exportedAt: new Date().toISOString(),
-      count: cookies.length,
-      cookies,
+      count: collected.cookies.length,
+      cookies: collected.cookies,
     };
   }
 
@@ -267,16 +382,24 @@
       }
 
       toast('正在导出当前站点 Cookie…', 'info', 1500);
-      const { source, cookies } = await collectCookies();
-      const payload = buildCookiePayload(source, cookies);
+      const collected = await collectCookies();
+      const payload = buildCookiePayload(collected);
       const res = await postJson(serverUrl, payload);
 
-      const message = res.ok ? `已上传 ${payload.count} 条 Cookie（${source}）` : res.message;
+      const message = res.ok ? `已上传 ${payload.count} 条 Cookie（${payload.source}）` : res.message;
       const result = { ok: res.ok, message };
 
       GM_setValue(K.lastResult, JSON.stringify({ at: payload.exportedAt, ...result }));
       log(silent ? `[自动] ${message}` : message, result.ok);
       if (!silent) toast(message, result.ok ? 'ok' : 'err');
+
+      // 字段不全时额外提示，避免"上传成功了但拿到手不能用"却不自知
+      if (res.ok && !payload.fieldComplete) {
+        log('⚠️ 字段不完整：' + payload.warnings.join('；'), false);
+        if (!silent) {
+          toast('注意：Cookie 字段不完整（缺 expirationDate / sameSite 等），详见日志', 'err', 6000);
+        }
+      }
 
       return result;
     } catch (err) {
