@@ -8,21 +8,26 @@
  *   PORT=9000 TOKEN=mysecret HOST=127.0.0.1 node receiver.js
  *
  * 环境变量：
- *   PORT  监听端口，默认 8787
- *   HOST  监听地址，默认 0.0.0.0；放在 Nginx 后面时建议设为 127.0.0.1，
- *         这样 8787 端口不会直接暴露到公网，只由反代访问
- *   TOKEN 鉴权令牌，为空则不校验（生产环境务必设置）
+ *   PORT                   监听端口，默认 8787
+ *   HOST                   监听地址，默认 0.0.0.0；放在反向代理后面时建议设为 127.0.0.1，
+ *                          这样端口不会直接暴露到公网，只由反代访问
+ *   TOKEN                  鉴权令牌，为空则不校验（生产环境务必设置）
+ *   LOG_FORMAT             日志格式：text（默认）或 json
+ *   MAX_SNAPSHOTS_PER_SITE 每站点保留的快照份数，默认 20；0 = 不限
+ *   RETENTION_DAYS         快照保留天数，默认 30；0 = 不按时间清理
+ *   DEDUP                  相同 Cookie 内容是否跳过重复落盘，默认开；设为 0 关闭
  *
  * 接口：
- *   GET  /api/ping         健康检查
+ *   GET  /health           健康检查（无需令牌，仅回基础状态）
+ *   GET  /api/ping         同上（兼容旧调用）
  *   POST /api/cookies      接收油猴脚本推送的 Cookie（需带 X-Auth-Token，若设置了 TOKEN）
  *   POST /api/credentials  接收油猴脚本推送的「你本人账号」凭据（同样需令牌）
  *
  * 数据落盘：
- *   server/data/cookies-<时间戳>.json     每次一份快照
- *   server/data/latest-<host>.json        每个站点最新一份
- *   server/data/cookies.jsonl             追加式日志（每行一条）
- *   server/data/credentials-<host>.json   凭据（覆盖式保存）
+ *   <DATA_DIR>/cookies-<host>-<时间戳>.json   每次内容变化一份快照（受保留策略约束）
+ *   <DATA_DIR>/latest-<host>.json             每个站点最新一份（总是覆盖）
+ *   <DATA_DIR>/cookies.jsonl                  追加式日志（内容未变则不追加）
+ *   <DATA_DIR>/credentials-<host>.json        凭据（覆盖式保存）
  *
  * ⚠️ /api/credentials 会以明文保存密码，仅限你私人服务器使用，
  *    务必启用 TOKEN + HTTPS，切勿暴露到公网。
@@ -33,14 +38,44 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
+// ---------------------------------------------------------------------------
+// 配置
+// ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0'; // 反代场景建议设为 127.0.0.1
 const TOKEN = process.env.TOKEN || ''; // 为空则不校验令牌
 const DATA_DIR = path.join(__dirname, 'data');
 
+const LOG_JSON = (process.env.LOG_FORMAT || 'text').toLowerCase() === 'json';
+const MAX_SNAPSHOTS = intEnv('MAX_SNAPSHOTS_PER_SITE', 20); // 0 = 不限
+const RETENTION_DAYS = intEnv('RETENTION_DAYS', 30); // 0 = 不按时间清理
+const DEDUP = (process.env.DEDUP || '1') !== '0';
+
+function intEnv(name, def) {
+  const v = parseInt(process.env[name] || String(def), 10);
+  return Number.isFinite(v) && v >= 0 ? v : def;
+}
+
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
+// ---------------------------------------------------------------------------
+// 日志（text / json 两种格式，统一走 stdout 交给 systemd、PM2、Docker 收集）
+// ---------------------------------------------------------------------------
+function log(level, msg, fields) {
+  const time = new Date().toISOString();
+  if (LOG_JSON) {
+    process.stdout.write(JSON.stringify({ time, level, msg, ...(fields || {}) }) + '\n');
+    return;
+  }
+  const suffix = fields && Object.keys(fields).length ? '  ' + JSON.stringify(fields) : '';
+  process.stdout.write(`[${new Date().toLocaleTimeString()}] ${level.padEnd(5)} ${msg}${suffix}\n`);
+}
+
+// ---------------------------------------------------------------------------
+// HTTP 小工具
+// ---------------------------------------------------------------------------
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -75,16 +110,93 @@ function safeName(host) {
   return String(host || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
+// ---------------------------------------------------------------------------
+// 落盘
+// ---------------------------------------------------------------------------
+
+/** 记录每个站点上一次的内容指纹，用于跳过重复落盘 */
+const lastFingerprint = new Map();
+
+/** 内容指纹：只取「站点 + Cookie 集合」，忽略 exportedAt 之类每次都变的字段 */
+function fingerprint(payload) {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify({ site: payload.site || '', cookies: payload.cookies || [] }))
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function unlinkQuietly(file) {
+  try {
+    fs.unlinkSync(file);
+    log('info', 'pruned', { file: path.basename(file) });
+  } catch (e) {
+    /* 已被别处删掉等情况，忽略 */
+  }
+}
+
+/** 保留策略：每站点份数上限 + 总体按天清理 */
+function prune() {
+  if (MAX_SNAPSHOTS === 0 && RETENTION_DAYS === 0) return;
+  let files;
+  try {
+    files = fs.readdirSync(DATA_DIR);
+  } catch (e) {
+    return;
+  }
+
+  // a) 每站点快照份数上限（文件名里带 ISO 时间戳，字典序即时间序）
+  if (MAX_SNAPSHOTS > 0) {
+    const bySite = new Map();
+    for (const f of files) {
+      const m = /^cookies-(.+?)-\d{4}-\d{2}-\d{2}T[\d-]+Z\.json$/.exec(f);
+      if (!m) continue;
+      if (!bySite.has(m[1])) bySite.set(m[1], []);
+      bySite.get(m[1]).push(f);
+    }
+    for (const list of bySite.values()) {
+      list.sort();
+      for (const f of list.slice(0, Math.max(0, list.length - MAX_SNAPSHOTS))) {
+        unlinkQuietly(path.join(DATA_DIR, f));
+      }
+    }
+  }
+
+  // b) 按 mtime 清理过期快照
+  if (RETENTION_DAYS > 0) {
+    const cutoff = Date.now() - RETENTION_DAYS * 86400000;
+    for (const f of files) {
+      if (!f.startsWith('cookies-') || !f.endsWith('.json')) continue;
+      const full = path.join(DATA_DIR, f);
+      try {
+        if (fs.statSync(full).mtimeMs < cutoff) unlinkQuietly(full);
+      } catch (e) {
+        /* 忽略 */
+      }
+    }
+  }
+}
+
 function persist(payload) {
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const host = safeName(payload.site);
+  const fp = fingerprint(payload);
 
-  // 1) 时间戳快照
-  fs.writeFileSync(path.join(DATA_DIR, `cookies-${host}-${ts}.json`), JSON.stringify(payload, null, 2));
-  // 2) 该站点最新
+  // 内容与上次一致 → 不重复写快照与 jsonl，只刷新 latest
+  const duplicate = DEDUP && lastFingerprint.get(payload.site) === fp;
+  lastFingerprint.set(payload.site, fp);
+
+  if (!duplicate) {
+    fs.writeFileSync(
+      path.join(DATA_DIR, `cookies-${host}-${ts}.json`),
+      JSON.stringify(payload, null, 2)
+    );
+    fs.appendFileSync(path.join(DATA_DIR, 'cookies.jsonl'), JSON.stringify(payload) + '\n');
+  }
   fs.writeFileSync(path.join(DATA_DIR, `latest-${host}.json`), JSON.stringify(payload, null, 2));
-  // 3) 追加日志
-  fs.appendFileSync(path.join(DATA_DIR, 'cookies.jsonl'), JSON.stringify(payload) + '\n');
+
+  prune();
+  return { duplicate };
 }
 
 function persistCredential(payload) {
@@ -96,7 +208,7 @@ function persistCredential(payload) {
   try {
     if (fs.existsSync(file)) store = JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch (e) {
-    /* 忽略损坏文件，重建 */
+    log('warn', 'credentials file unreadable, rebuilt', { file });
   }
   if (!Array.isArray(store.entries)) store.entries = [];
 
@@ -114,6 +226,11 @@ function persistCredential(payload) {
   fs.writeFileSync(file, JSON.stringify(store, null, 2));
 }
 
+// ---------------------------------------------------------------------------
+// 路由
+// ---------------------------------------------------------------------------
+const startedAt = Date.now();
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, CORS);
@@ -123,13 +240,21 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url, `http://${req.headers.host}`);
 
-  if (req.method === 'GET' && url.pathname === '/api/ping') {
-    return send(res, 200, { ok: true, service: 'cookie-sync', time: new Date().toISOString() });
+  // 健康检查：不校验令牌，只回基础状态（不含任何数据）
+  if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/api/ping')) {
+    return send(res, 200, {
+      ok: true,
+      service: 'cookie-sync',
+      uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+      tokenRequired: Boolean(TOKEN),
+      time: new Date().toISOString(),
+    });
   }
 
   // 令牌校验（仅在设置了环境变量 TOKEN 时启用）
   const checkToken = () => {
     if (TOKEN && req.headers['x-auth-token'] !== TOKEN) {
+      log('warn', 'rejected', { reason: 'bad token', path: url.pathname, ip: req.socket.remoteAddress });
       send(res, 401, { ok: false, error: 'unauthorized: X-Auth-Token 不正确' });
       return false;
     }
@@ -146,13 +271,21 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { ok: false, error: 'payload.cookies 必须是数组' });
       }
 
-      persist(payload);
-      console.log(
-        `[${new Date().toLocaleTimeString()}] 收到 ${payload.site} 的 ${payload.cookies.length} 条 Cookie（来源 ${payload.source}）`
-      );
-      return send(res, 200, { ok: true, received: payload.cookies.length, site: payload.site });
+      const { duplicate } = persist(payload);
+      log('info', 'cookies received', {
+        site: payload.site,
+        count: payload.cookies.length,
+        source: payload.source,
+        duplicate,
+      });
+      return send(res, 200, {
+        ok: true,
+        received: payload.cookies.length,
+        site: payload.site,
+        duplicate,
+      });
     } catch (err) {
-      console.error('处理失败：', err.message);
+      log('error', 'cookies failed', { msg: err.message });
       return send(res, 400, { ok: false, error: err.message });
     }
   }
@@ -169,23 +302,55 @@ const server = http.createServer(async (req, res) => {
       }
 
       persistCredential(payload);
-      console.log(
-        `[${new Date().toLocaleTimeString()}] 收到 ${payload.site} 的凭据（账号 ${payload.username}）`
-      );
+      log('info', 'credential received', { site: payload.site, username: payload.username });
       return send(res, 200, { ok: true, site: payload.site, username: payload.username });
     } catch (err) {
-      console.error('处理失败：', err.message);
+      log('error', 'credential failed', { msg: err.message });
       return send(res, 400, { ok: false, error: err.message });
     }
   }
 
   send(res, 404, { ok: false, error: 'not found' });
 });
+
+// ---------------------------------------------------------------------------
+// 启动与退出
+// ---------------------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log('Cookie Sync 接收端已启动');
-  console.log(`  监听地址 : http://${HOST}:${PORT}`);
-  console.log(`  Cookie   : http://<你的服务器IP>:${PORT}/api/cookies`);
-  console.log(`  凭据     : http://<你的服务器IP>:${PORT}/api/credentials`);
-  console.log(`  鉴权令牌 : ${TOKEN ? '已启用（X-Auth-Token）' : '未启用（任何人可推送，建议设置 TOKEN）'}`);
-  console.log(`  数据目录 : ${DATA_DIR}`);
+  log('info', 'started', {
+    listen: `${HOST}:${PORT}`,
+    tokenRequired: Boolean(TOKEN),
+    logFormat: LOG_JSON ? 'json' : 'text',
+    dataDir: DATA_DIR,
+    maxSnapshotsPerSite: MAX_SNAPSHOTS,
+    retentionDays: RETENTION_DAYS,
+    dedup: DEDUP,
+  });
+  prune(); // 启动先按保留策略清一遍
+});
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log('info', 'shutting down', { signal });
+  server.close(() => {
+    log('info', 'closed');
+    process.exit(0);
+  });
+  // 兜底：5 秒内没关干净就强退（避免 systemd 等到超时再 SIGKILL）
+  setTimeout(() => {
+    log('warn', 'force exit');
+    process.exit(0);
+  }, 5000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('uncaughtException', (err) => {
+  log('error', 'uncaughtException', { msg: err.message, stack: err.stack });
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  log('error', 'unhandledRejection', { msg: String(reason) });
 });

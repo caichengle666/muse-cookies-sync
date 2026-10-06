@@ -70,32 +70,49 @@ set PORT=9000&& set TOKEN=mysecret&& node receiver.js
 $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 ```
 
-启动后输出：
+启动后输出（默认 `text` 格式；设 `LOG_FORMAT=json` 则输出 JSON 行）：
 
 ```
-Cookie Sync 接收端已启动
-  监听地址 : http://0.0.0.0:8787
-  油猴填入 : http://<你的服务器IP>:8787/api/cookies
-  鉴权令牌 : 已启用（X-Auth-Token）
-  数据目录 : .../server/data
+[15:08:12] info  started  {"listen":"0.0.0.0:8787","tokenRequired":true,"logFormat":"text","dataDir":".../server/data"}
 ```
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORT` | `8787` | 监听端口 |
+| `HOST` | `0.0.0.0` | 监听地址；放在反向代理后面时设 `127.0.0.1`，端口就不会直接暴露到公网 |
+| `TOKEN` | 空 | 鉴权令牌；为空则不校验，**生产环境务必设置** |
+| `LOG_FORMAT` | `text` | 日志格式：`text` 或 `json` |
+| `MAX_SNAPSHOTS_PER_SITE` | `20` | 每个站点保留的快照份数；`0` = 不限 |
+| `RETENTION_DAYS` | `30` | 快照保留天数；`0` = 不按时间清理 |
+| `DEDUP` | `1` | 相同 Cookie 内容是否跳过重复落盘；设 `0` 关闭 |
+
+### 服务端行为
+
+- **健康检查**：`GET /health`（无需令牌），返回 `uptimeSec` / `tokenRequired`，可直接给 systemd、Docker 或负载均衡当探针用。
+- **去重**：内容指纹只看「站点 + Cookie 集合」，忽略 `exportedAt` 这类每次都变的字段。内容没变就不再写快照和 `cookies.jsonl`，响应里带 `duplicate:true`；`latest-<host>.json` 仍会刷新。
+- **保留策略**：每次写入后按 `MAX_SNAPSHOTS_PER_SITE` 与 `RETENTION_DAYS` 清理旧快照（启动时也清一遍），避免 `data/` 无限增长。
+- **优雅退出**：收到 `SIGTERM` / `SIGINT` 后停止接收新请求、写完在途数据再退出，5 秒兜底强退。systemd 重启、`docker stop` 都能安全收尾。
+- **日志**：统一走 stdout（交给 systemd / PM2 / Docker 收集），可选 JSON 便于采集；鉴权失败会记录来源 IP。
 
 **部署到远程服务器时**，记得在云厂商安全组 / 防火墙上放行对应端口，
-并建议用 Nginx 反代 + HTTPS（浏览器会拦截部分混合内容请求）。
+并建议用 Nginx 反代 + HTTPS。
 
 接口一览：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/ping` | 健康检查，返回 `{ok:true}` |
+| GET | `/health` | 健康检查（无需令牌），返回 `{ok,uptimeSec,tokenRequired,time}` |
+| GET | `/api/ping` | 同上，兼容旧调用 |
 | POST | `/api/cookies` | 接收 Cookie；设置 `TOKEN` 后需带 `X-Auth-Token` |
 | POST | `/api/credentials` | 接收「你本人账号」凭据（`site`/`username`/`password`），同样需令牌 |
 
 落盘文件（`server/data/`）：
 
-- `cookies-<host>-<时间戳>.json` —— 每次导出的快照
-- `latest-<host>.json` —— 该站点最新一份
-- `cookies.jsonl` —— 追加式日志（每行一条 JSON）
+- `cookies-<host>-<时间戳>.json` —— 内容变化时写一份快照（受保留策略约束）
+- `latest-<host>.json` —— 该站点最新一份（总是覆盖）
+- `cookies.jsonl` —— 追加式日志，内容未变则不追加
 - `credentials-<host>.json` —— 凭据文件（**明文保存**，按账号归并）
 
 ---
