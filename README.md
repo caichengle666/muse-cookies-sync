@@ -3,6 +3,8 @@
 读取浏览器「本地 Cookie / 当前网站 Cookie」，并通过油猴脚本推送到你**自建服务器**；
 同时提供一个**个人凭据保险箱**，保存并一键填入**你自己账号**的登录凭据。
 
+![界面预览](_test/preview-export-ok.png)
+
 > ⚠️ **合规边界（务必遵守）**
 > 本工具仅用于处理**你自己**的数据：导出**你自己账号**在**你自己设备**上的 Cookie，
 > 或保存**你自己**的登录凭据。
@@ -20,6 +22,14 @@ cookie-sync/
 │   ├── receiver.js          # 零依赖接收端（Node.js 原生 http）
 │   ├── package.json
 │   └── data/                # 接收到的 Cookie 落盘目录（自动生成）
+├── deploy/                  # VPS 部署配置
+│   ├── nginx-cookie-sync.conf   # Nginx 反代 + HTTPS
+│   ├── cookie-sync.service      # systemd 常驻
+│   ├── ecosystem.config.js      # PM2 备选
+│   └── cookie-sync.env.example  # 环境变量模板
+├── _test/
+│   ├── harness.html             # 本地测试台（桩掉 GM_* API）
+│   └── preview-*.png            # 界面截图
 └── README.md
 ```
 
