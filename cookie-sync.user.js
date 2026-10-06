@@ -2,8 +2,8 @@
 // @name         Cookie Sync · Cookie 同步 & 个人凭据保险箱
 // @name:zh-CN   Cookie 同步 / 个人凭据保险箱
 // @namespace    local.cookie.sync
-// @version      1.2.0
-// @description  个人工具：导出当前站点 Cookie；维护「你自己账号」的登录凭据并可一键填入登录表单，可选同步到你的鉴权服务器
+// @version      1.3.0
+// @description  个人工具：导出当前站点 Cookie；维护「你自己账号」的登录凭据并可一键填入登录表单，可选同步到你的鉴权服务器；支持隐藏页面浮漂
 // @author       you
 // @match        http://*/*
 // @match        https://*/*
@@ -58,6 +58,7 @@
     lastResult: 'cs_last_result',
     vault: 'cs_vault',
     pos: 'cs_pos', // 浮漂位置
+    showFloat: 'cs_show_float', // 是否显示页面浮漂
   };
 
   const getCfg = () => ({
@@ -369,6 +370,19 @@
   // ---------------------------------------------------------------------------
   let logEl = null;
   let refreshVaultList = () => {};
+  let hostEl = null; // 浮漂宿主元素
+  let panelEl = null; // 面板元素
+  let forceShown = false; // 浮漂已关闭时，通过菜单临时显示
+
+  /** 依据「显示浮漂」开关应用可见性；关闭后仍可用油猴菜单打开面板 */
+  function applyFloatVisibility() {
+    if (!hostEl) return;
+    const enabled = GM_getValue(K.showFloat, true);
+    hostEl.style.display = enabled || forceShown ? '' : 'none';
+    // 同步面板里的开关状态（例如通过菜单切换时）
+    const chk = panelEl && panelEl.querySelector('#showfloat');
+    if (chk) chk.checked = enabled;
+  }
 
   function log(msg, ok) {
     if (!logEl) return;
@@ -465,11 +479,34 @@
         }
         .muted { color: #64748b; font-size: 11px; margin-top: 8px; line-height: 1.6; }
         .warn { color: #fbbf24; }
+
+        /* 面板标题栏 + 关闭按钮 */
+        .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+        .head h3 { margin: 0; font-size: 13px; font-weight: 600; color: #f8fafc; }
+        .head .x {
+          width: 22px; height: 22px; padding: 0; line-height: 20px; text-align: center;
+          border-radius: 6px; border: 1px solid #334155; background: #0f172a;
+          color: #94a3b8; cursor: pointer; font-size: 14px;
+        }
+        .head .x:hover { color: #fca5a5; border-color: #fca5a5; }
+
+        /* 底部开关行 */
+        .switch {
+          display: flex; align-items: center; justify-content: space-between;
+          margin-top: 14px; padding-top: 10px; border-top: 1px solid #334155;
+          color: #cbd5e1; font-size: 12px;
+        }
+        .switch input { width: auto; margin: 0; accent-color: #2563eb; cursor: pointer; }
       </style>
 
       <button class="btn" title="Cookie Sync / 凭据保险箱（可拖动）">🍪</button>
 
       <div class="panel">
+        <div class="head">
+          <h3>Cookie Sync</h3>
+          <button class="x" id="close" title="收起面板">×</button>
+        </div>
+
         <div class="tabs">
           <button data-tab="cookie" class="active">Cookie 同步</button>
           <button data-tab="vault">我的凭据</button>
@@ -518,12 +555,41 @@
           <div class="list" id="v-list"></div>
           <div class="muted warn">上传使用「Cookie 同步」标签页里的服务器地址与令牌；建议仅走 HTTPS。</div>
         </div>
+
+        <label class="switch">
+          <span>在页面显示浮漂</span>
+          <input type="checkbox" id="showfloat" ${GM_getValue(K.showFloat, true) ? 'checked' : ''}>
+        </label>
       </div>
     `;
 
     const btn = root.querySelector('.btn');
     const panel = root.querySelector('.panel');
     logEl = root.querySelector('#log');
+    hostEl = host;
+    panelEl = panel;
+
+    // ---- 收起面板（× 按钮）----
+    root.querySelector('#close').addEventListener('click', () => {
+      panel.classList.remove('open');
+      forceShown = false;
+      applyFloatVisibility();
+    });
+
+    // ---- 「在页面显示浮漂」开关 ----
+    const floatChk = root.querySelector('#showfloat');
+    floatChk.addEventListener('change', () => {
+      GM_setValue(K.showFloat, floatChk.checked);
+      forceShown = false;
+      applyFloatVisibility();
+      toast(
+        floatChk.checked ? '已显示浮漂' : '已隐藏浮漂（可用油猴菜单「打开面板」再次打开）',
+        'ok'
+      );
+    });
+
+    // 应用初始可见性（重启页面后开关依然生效）
+    applyFloatVisibility();
 
     // ---- 拖拽 + 点击开合 ----
     let dragging = false;
@@ -731,9 +797,21 @@
     toast(r.pwd || r.user ? '已填入登录表单，请自行点击登录' : '未找到登录输入框', r.pwd || r.user ? 'ok' : 'err');
   });
   GM_registerMenuCommand('⚙️ 打开面板', () => {
-    const host = document.getElementById('cookie-sync-host');
-    if (host && host.shadowRoot) host.shadowRoot.querySelector('.panel').classList.add('open');
-    else toast('面板尚未挂载，请刷新页面', 'err');
+    if (!hostEl || !panelEl) {
+      toast('面板尚未挂载，请刷新页面', 'err');
+      return;
+    }
+    forceShown = true; // 浮漂已关闭时也能打开面板
+    applyFloatVisibility();
+    panelEl.classList.add('open');
+  });
+
+  GM_registerMenuCommand('🫥 显示 / 隐藏浮漂', () => {
+    const next = !GM_getValue(K.showFloat, true);
+    GM_setValue(K.showFloat, next);
+    forceShown = false;
+    applyFloatVisibility();
+    toast(next ? '已显示浮漂' : '已隐藏浮漂', 'ok');
   });
 
   // ---------------------------------------------------------------------------
@@ -770,6 +848,7 @@
     if (document.body && !document.getElementById('cookie-sync-host')) {
       try {
         logEl = null;
+        forceShown = false;
         mountUI();
       } catch (e) {
         /* ignore */
