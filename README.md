@@ -17,6 +17,7 @@
 
 ```
 cookie-sync/
+├── SKILL.md                 # 给 AI 的安装、部署和维护说明
 ├── cookie-sync.user.js      # 油猴脚本（Tampermonkey / Violentmonkey）
 ├── server/
 │   ├── receiver.js          # 零依赖接收端（Node.js 原生 http）
