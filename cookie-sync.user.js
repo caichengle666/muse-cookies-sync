@@ -2,7 +2,7 @@
 // @name         Cookie Sync · Cookie 同步 & 个人凭据保险箱
 // @name:zh-CN   Cookie 同步 / 个人凭据保险箱
 // @namespace    local.cookie.sync
-// @version      1.4.0
+// @version      1.5.0
 // @description  个人工具：导出当前站点 Cookie（统一字段、多域合并去重）；维护「你自己账号」的登录凭据并可一键填入登录表单，可选同步到你的鉴权服务器；支持隐藏页面浮漂
 // @author       you
 // @match        http://*/*
@@ -75,6 +75,62 @@
       return '';
     }
   };
+
+  /**
+   * 纯 DOM 构建：**完全不经过 HTML 解析**。
+   *
+   * 背景：不少站点启用了 Trusted Types CSP（`require-trusted-types-for 'script'`）。
+   * 在这种页面里 `innerHTML = '...'` 会被拦，**连 `DOMParser.parseFromString` 也会被拦**
+   * （Chrome 实测：`Failed to execute 'parseFromString' ... requires 'TrustedHTML'`）。
+   * 所以 UI 一律走 createElement / createTextNode / setAttribute，不碰任何 HTML 注入点。
+   *
+   * 用法：mk('div', { class: 'row', 'data-tab': 'x' }, [child, '文本'])
+   */
+  function mk(tag, attrs, children) {
+    const node = document.createElement(tag);
+    if (attrs) {
+      for (const k in attrs) {
+        const v = attrs[k];
+        if (v === null || v === undefined || v === false) continue;
+        if (k === 'class') node.className = v;
+        else if (k === 'text') node.textContent = v;
+        else node.setAttribute(k, v === true ? '' : String(v));
+      }
+    }
+    if (children !== undefined && children !== null) {
+      for (const c of Array.isArray(children) ? children : [children]) {
+        if (c === null || c === undefined || c === false) continue;
+        node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+      }
+    }
+    return node;
+  }
+
+  /**
+   * 给 ShadowRoot 上样式。优先用**构造式样式表**（adoptedStyleSheets）：
+   * 它不经过 `<style>` 元素，既不受 Trusted Types 影响，也绕开站点 CSP 的 `style-src`
+   * 限制（很多严格站点没有 'unsafe-inline'，注入 <style> 会被拦，表现是"面板没样式"）。
+   */
+  function applyStyles(shadowRoot, css) {
+    try {
+      if (typeof CSSStyleSheet === 'function' && 'replaceSync' in CSSStyleSheet.prototype) {
+        const sheet = new CSSStyleSheet();
+        sheet.replaceSync(css);
+        shadowRoot.adoptedStyleSheets = [sheet];
+        return;
+      }
+    } catch (e) {
+      dbg('adoptedStyleSheets 不可用，回退 <style>：', e);
+    }
+    const style = document.createElement('style');
+    style.textContent = css;
+    shadowRoot.appendChild(style);
+  }
+
+  /** 清空子节点（不触发 innerHTML） */
+  function clearChildren(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
 
   // ---------------------------------------------------------------------------
   // Cookie 采集
@@ -304,31 +360,16 @@
 
   function ensureToastRoot() {
     if (toastRoot && toastHostEl && document.body.contains(toastHostEl)) return toastRoot;
-    const h = document.createElement('div');
-    h.id = 'cookie-sync-toast-host';
-    h.style.cssText =
+    const box = document.createElement('div');
+    box.id = 'cookie-sync-toast-host';
+    box.style.cssText =
       'position:fixed;z-index:2147483647;top:16px;left:50%;transform:translateX(-50%);pointer-events:none;';
-    document.body.appendChild(h);
-    const root = h.attachShadow({ mode: 'open' });
-    root.innerHTML = `
-      <style>
-        :host { all: initial; }
-        .wrap { display: flex; flex-direction: column; gap: 8px; align-items: center; }
-        .t {
-          max-width: 80vw; padding: 10px 16px; border-radius: 10px; font-size: 13px; line-height: 1.5;
-          font-family: system-ui, "Microsoft YaHei", sans-serif; color: #f1f5f9;
-          background: #1e293b; border: 1px solid #334155; border-left: 4px solid #64748b;
-          box-shadow: 0 8px 24px rgba(0,0,0,.45);
-          transition: opacity .25s ease, transform .25s ease;
-        }
-        .t.ok { border-left-color: #22c55e; }
-        .t.err { border-left-color: #ef4444; }
-        .t.info { border-left-color: #3b82f6; }
-      </style>
-      <div class="wrap"></div>
-    `;
+    document.body.appendChild(box);
+    const root = box.attachShadow({ mode: 'open' });
+    applyStyles(root, TOAST_CSS);
+    root.appendChild(mk('div', { class: 'wrap' }));
     // 注意：ShadowRoot.host 是只读属性，不能赋值，必须另存元素引用
-    toastHostEl = h;
+    toastHostEl = box;
     toastRoot = root;
     return root;
   }
@@ -532,6 +573,182 @@
     return null;
   }
 
+  const TOAST_CSS = `
+    :host { all: initial; }
+    .wrap { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+    .t {
+      max-width: 80vw; padding: 10px 16px; border-radius: 10px; font-size: 13px; line-height: 1.5;
+      font-family: system-ui, "Microsoft YaHei", sans-serif; color: #f1f5f9;
+      background: #1e293b; border: 1px solid #334155; border-left: 4px solid #64748b;
+      box-shadow: 0 8px 24px rgba(0,0,0,.45);
+      transition: opacity .25s ease, transform .25s ease;
+    }
+    .t.ok { border-left-color: #22c55e; }
+    .t.err { border-left-color: #ef4444; }
+    .t.info { border-left-color: #3b82f6; }
+  `;
+
+  const PANEL_CSS = `
+    :host { all: initial; }
+    * { box-sizing: border-box; font-family: system-ui, "Microsoft YaHei", sans-serif; }
+    .btn {
+      width: 44px; height: 44px; border-radius: 50%; border: none; cursor: grab;
+      background: #2563eb; color: #fff; font-size: 20px; line-height: 44px; text-align: center;
+      box-shadow: 0 4px 12px rgba(0,0,0,.35); user-select: none; touch-action: none;
+    }
+    .btn:hover { background: #1d4ed8; }
+    .btn:active { cursor: grabbing; }
+    .panel {
+      display: none; position: absolute; right: 0; bottom: 52px; width: 340px;
+      max-height: 82vh; overflow: auto;
+      background: #1e293b; color: #e2e8f0;
+      border: 1px solid #334155; border-radius: 12px; padding: 14px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.5); font-size: 13px;
+    }
+    .panel.open { display: block; }
+    .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+    .tabs button {
+      flex: 1; padding: 7px; border-radius: 8px; border: 1px solid #334155;
+      background: #0f172a; color: #94a3b8; cursor: pointer; font-size: 12px;
+    }
+    .tabs button.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+    .tab { display: none; }
+    .tab.active { display: block; }
+    label { display: block; margin: 8px 0 3px; color: #94a3b8; font-size: 12px; }
+    input[type=text], input[type=password] {
+      width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid #334155;
+      background: #0f172a; color: #e2e8f0; font-size: 12px;
+    }
+    .row { display: flex; gap: 8px; margin-top: 12px; }
+    .row button {
+      flex: 1; padding: 8px; border-radius: 6px; border: 1px solid #334155;
+      background: #0f172a; color: #e2e8f0; cursor: pointer; font-size: 12px;
+    }
+    .row button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    .row button:hover { filter: brightness(1.15); }
+    .chk { display: flex; align-items: center; gap: 6px; margin-top: 10px; color: #cbd5e1; }
+    .log {
+      margin-top: 10px; max-height: 110px; overflow: auto; background: #0f172a;
+      border: 1px solid #1e293b; border-radius: 6px; padding: 6px; font-size: 11px; line-height: 1.5;
+    }
+    .list { margin-top: 10px; border-top: 1px solid #334155; padding-top: 8px; }
+    .item {
+      display: flex; align-items: center; gap: 6px; padding: 5px 0; font-size: 12px;
+      border-bottom: 1px dashed #334155;
+    }
+    .item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .item button {
+      padding: 3px 8px; font-size: 11px; border-radius: 5px; cursor: pointer;
+      border: 1px solid #334155; background: #0f172a; color: #e2e8f0;
+    }
+    .muted { color: #64748b; font-size: 11px; margin-top: 8px; line-height: 1.6; }
+    .mt0 { margin-top: 0; }
+    .warn { color: #fbbf24; }
+
+    /* 面板标题栏 + 关闭按钮 */
+    .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .head h3 { margin: 0; font-size: 13px; font-weight: 600; color: #f8fafc; }
+    .head .x {
+      width: 22px; height: 22px; padding: 0; line-height: 20px; text-align: center;
+      border-radius: 6px; border: 1px solid #334155; background: #0f172a;
+      color: #94a3b8; cursor: pointer; font-size: 14px;
+    }
+    .head .x:hover { color: #fca5a5; border-color: #fca5a5; }
+
+    /* 底部开关行 */
+    .switch {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-top: 14px; padding-top: 10px; border-top: 1px solid #334155;
+      color: #cbd5e1; font-size: 12px;
+    }
+    .switch input { width: auto; margin: 0; accent-color: #2563eb; cursor: pointer; }
+  `;
+
+  /** 用纯 DOM 拼出面板（不经任何 HTML 解析，兼容 Trusted Types 站点） */
+  function buildPanel(cfg) {
+    return mk('div', { class: 'panel' }, [
+      mk('div', { class: 'head' }, [
+        mk('h3', { text: 'Cookie Sync' }),
+        mk('button', { class: 'x', id: 'close', title: '收起面板', text: '×' }),
+      ]),
+
+      mk('div', { class: 'tabs' }, [
+        mk('button', { 'data-tab': 'cookie', class: 'active', text: 'Cookie 同步' }),
+        mk('button', { 'data-tab': 'vault', text: '我的凭据' }),
+      ]),
+
+      // ---- Cookie 标签 ----
+      mk('div', { class: 'tab active', 'data-tab': 'cookie' }, [
+        mk('label', { text: '服务器接口地址（POST）' }),
+        mk('input', {
+          type: 'text',
+          id: 'url',
+          placeholder: 'http://127.0.0.1:8787/api/cookies',
+          value: cfg.serverUrl,
+        }),
+
+        mk('label', { text: '鉴权令牌 X-Auth-Token（可选）' }),
+        mk('input', {
+          type: 'password',
+          id: 'token',
+          placeholder: '留空则不带令牌',
+          value: cfg.authToken,
+        }),
+
+        mk('label', { class: 'chk' }, [
+          mk('input', { type: 'checkbox', id: 'auto', checked: cfg.autoExport }),
+          ' 打开页面时自动导出当前站点',
+        ]),
+
+        mk('div', { class: 'row' }, [
+          mk('button', { class: 'primary', id: 'now', text: '立即导出' }),
+          mk('button', { id: 'save', text: '保存配置' }),
+        ]),
+
+        mk('div', { class: 'log', id: 'log' }),
+        mk('div', { class: 'muted', text: `当前站点：${location.hostname}` }),
+      ]),
+
+      // ---- 凭据标签 ----
+      mk('div', { class: 'tab', 'data-tab': 'vault' }, [
+        mk('div', { class: 'muted mt0' }, [
+          '仅用于保存',
+          mk('b', { text: '你自己账号' }),
+          '的凭据。内容以混淆形式存于本机油猴存储，非强加密。',
+        ]),
+
+        mk('label', { text: '网站（默认当前站点）' }),
+        mk('input', { type: 'text', id: 'v-host', value: location.hostname }),
+
+        mk('label', { text: '账号 / 用户名' }),
+        mk('input', { type: 'text', id: 'v-user', placeholder: 'your@account' }),
+
+        mk('label', { text: '密码' }),
+        mk('input', { type: 'password', id: 'v-pass', placeholder: '你的密码' }),
+
+        mk('label', { text: '备注（可选）' }),
+        mk('input', { type: 'text', id: 'v-note', placeholder: '例如：主号 / 备用' }),
+
+        mk('div', { class: 'row' }, [
+          mk('button', { class: 'primary', id: 'v-save', text: '保存到本地' }),
+          mk('button', { id: 'v-upload', text: '上传到服务器' }),
+        ]),
+
+        mk('div', { class: 'list', id: 'v-list' }),
+        mk('div', {
+          class: 'muted warn',
+          text: '上传使用「Cookie 同步」标签页里的服务器地址与令牌；建议仅走 HTTPS。',
+        }),
+      ]),
+
+      // ---- 底部开关 ----
+      mk('label', { class: 'switch' }, [
+        mk('span', { text: '在页面显示浮漂' }),
+        mk('input', { type: 'checkbox', id: 'showfloat', checked: GM_getValue(K.showFloat, true) }),
+      ]),
+    ]);
+  }
+
   function mountUI() {
     if (document.getElementById('cookie-sync-host')) return; // 防止重复挂载
 
@@ -546,145 +763,11 @@
     const root = host.attachShadow({ mode: 'open' });
     const cfg = getCfg();
 
-    root.innerHTML = `
-      <style>
-        :host { all: initial; }
-        * { box-sizing: border-box; font-family: system-ui, "Microsoft YaHei", sans-serif; }
-        .btn {
-          width: 44px; height: 44px; border-radius: 50%; border: none; cursor: grab;
-          background: #2563eb; color: #fff; font-size: 20px; line-height: 44px; text-align: center;
-          box-shadow: 0 4px 12px rgba(0,0,0,.35); user-select: none; touch-action: none;
-        }
-        .btn:hover { background: #1d4ed8; }
-        .btn:active { cursor: grabbing; }
-        .panel {
-          display: none; position: absolute; right: 0; bottom: 52px; width: 340px;
-          max-height: 82vh; overflow: auto;
-          background: #1e293b; color: #e2e8f0;
-          border: 1px solid #334155; border-radius: 12px; padding: 14px;
-          box-shadow: 0 10px 30px rgba(0,0,0,.5); font-size: 13px;
-        }
-        .panel.open { display: block; }
-        .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
-        .tabs button {
-          flex: 1; padding: 7px; border-radius: 8px; border: 1px solid #334155;
-          background: #0f172a; color: #94a3b8; cursor: pointer; font-size: 12px;
-        }
-        .tabs button.active { background: #2563eb; border-color: #2563eb; color: #fff; }
-        .tab { display: none; }
-        .tab.active { display: block; }
-        label { display: block; margin: 8px 0 3px; color: #94a3b8; font-size: 12px; }
-        input[type=text], input[type=password] {
-          width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid #334155;
-          background: #0f172a; color: #e2e8f0; font-size: 12px;
-        }
-        .row { display: flex; gap: 8px; margin-top: 12px; }
-        .row button {
-          flex: 1; padding: 8px; border-radius: 6px; border: 1px solid #334155;
-          background: #0f172a; color: #e2e8f0; cursor: pointer; font-size: 12px;
-        }
-        .row button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
-        .row button:hover { filter: brightness(1.15); }
-        .chk { display: flex; align-items: center; gap: 6px; margin-top: 10px; color: #cbd5e1; }
-        .log {
-          margin-top: 10px; max-height: 110px; overflow: auto; background: #0f172a;
-          border: 1px solid #1e293b; border-radius: 6px; padding: 6px; font-size: 11px; line-height: 1.5;
-        }
-        .list { margin-top: 10px; border-top: 1px solid #334155; padding-top: 8px; }
-        .item {
-          display: flex; align-items: center; gap: 6px; padding: 5px 0; font-size: 12px;
-          border-bottom: 1px dashed #334155;
-        }
-        .item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .item button {
-          padding: 3px 8px; font-size: 11px; border-radius: 5px; cursor: pointer;
-          border: 1px solid #334155; background: #0f172a; color: #e2e8f0;
-        }
-        .muted { color: #64748b; font-size: 11px; margin-top: 8px; line-height: 1.6; }
-        .warn { color: #fbbf24; }
-
-        /* 面板标题栏 + 关闭按钮 */
-        .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-        .head h3 { margin: 0; font-size: 13px; font-weight: 600; color: #f8fafc; }
-        .head .x {
-          width: 22px; height: 22px; padding: 0; line-height: 20px; text-align: center;
-          border-radius: 6px; border: 1px solid #334155; background: #0f172a;
-          color: #94a3b8; cursor: pointer; font-size: 14px;
-        }
-        .head .x:hover { color: #fca5a5; border-color: #fca5a5; }
-
-        /* 底部开关行 */
-        .switch {
-          display: flex; align-items: center; justify-content: space-between;
-          margin-top: 14px; padding-top: 10px; border-top: 1px solid #334155;
-          color: #cbd5e1; font-size: 12px;
-        }
-        .switch input { width: auto; margin: 0; accent-color: #2563eb; cursor: pointer; }
-      </style>
-
-      <button class="btn" title="Cookie Sync / 凭据保险箱（可拖动）">🍪</button>
-
-      <div class="panel">
-        <div class="head">
-          <h3>Cookie Sync</h3>
-          <button class="x" id="close" title="收起面板">×</button>
-        </div>
-
-        <div class="tabs">
-          <button data-tab="cookie" class="active">Cookie 同步</button>
-          <button data-tab="vault">我的凭据</button>
-        </div>
-
-        <div class="tab active" data-tab="cookie">
-          <label>服务器接口地址（POST）</label>
-          <input type="text" id="url" placeholder="http://127.0.0.1:8787/api/cookies" value="${cfg.serverUrl}">
-
-          <label>鉴权令牌 X-Auth-Token（可选）</label>
-          <input type="password" id="token" placeholder="留空则不带令牌" value="${cfg.authToken}">
-
-          <label class="chk"><input type="checkbox" id="auto" ${cfg.autoExport ? 'checked' : ''}> 打开页面时自动导出当前站点</label>
-
-          <div class="row">
-            <button class="primary" id="now">立即导出</button>
-            <button id="save">保存配置</button>
-          </div>
-
-          <div class="log" id="log"></div>
-          <div class="muted">当前站点：${location.hostname}</div>
-        </div>
-
-        <div class="tab" data-tab="vault">
-          <div class="muted" style="margin-top:0">
-            仅用于保存<b>你自己账号</b>的凭据。内容以混淆形式存于本机油猴存储，非强加密。
-          </div>
-
-          <label>网站（默认当前站点）</label>
-          <input type="text" id="v-host" value="${location.hostname}">
-
-          <label>账号 / 用户名</label>
-          <input type="text" id="v-user" placeholder="your@account">
-
-          <label>密码</label>
-          <input type="password" id="v-pass" placeholder="你的密码">
-
-          <label>备注（可选）</label>
-          <input type="text" id="v-note" placeholder="例如：主号 / 备用">
-
-          <div class="row">
-            <button class="primary" id="v-save">保存到本地</button>
-            <button id="v-upload">上传到服务器</button>
-          </div>
-
-          <div class="list" id="v-list"></div>
-          <div class="muted warn">上传使用「Cookie 同步」标签页里的服务器地址与令牌；建议仅走 HTTPS。</div>
-        </div>
-
-        <label class="switch">
-          <span>在页面显示浮漂</span>
-          <input type="checkbox" id="showfloat" ${GM_getValue(K.showFloat, true) ? 'checked' : ''}>
-        </label>
-      </div>
-    `;
+    applyStyles(root, PANEL_CSS);
+    root.appendChild(
+      mk('button', { class: 'btn', title: 'Cookie Sync / 凭据保险箱（可拖动）', text: '🍪' })
+    );
+    root.appendChild(buildPanel(cfg));
 
     const btn = root.querySelector('.btn');
     const panel = root.querySelector('.panel');
@@ -846,10 +929,13 @@
       const host = root.querySelector('#v-host').value.trim() || location.hostname;
       const listEl = root.querySelector('#v-list');
       const list = getVault()[host] || [];
-      listEl.innerHTML = '';
+      clearChildren(listEl);
 
       if (!list.length) {
-        listEl.innerHTML = '<div class="muted">该站点暂无已保存凭据</div>';
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.textContent = '该站点暂无已保存凭据';
+        listEl.appendChild(empty);
         return;
       }
 

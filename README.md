@@ -315,12 +315,27 @@ A：可以。按住 🍪 拖动即可移动，松手后位置会保存，下次�
 **Q：为什么提示里显示 `document.cookie` 而不是 `GM_cookie`？**
 A：说明 Tampermonkey 的 `GM_cookie` 未授权，脚本自动回退到 `document.cookie`，此时读不到 HttpOnly Cookie。到油猴设置里允许该权限即可。
 
+**Q：在开启严格 CSP 的站点上，浮漂点了没反应，控制台报 `requires 'TrustedHTML'`？**
+A：这是 **Trusted Types** 站点（`require-trusted-types-for 'script'`）——v1.5.0 起已彻底解决。
+旧版本用 `innerHTML` 建界面会被浏览器拦下；改用 `DOMParser` 也不行（Chrome 把
+`parseFromString` 同样当作注入点）。现在界面**全部用 `createElement` 纯 DOM 拼**，
+完全不经过 HTML 解析；样式改用**构造式样式表**（`adoptedStyleSheets`），
+顺带绕开站点 `style-src` 对 `<style>` 的限制。
+若仍看不到样式，看控制台是否有 `adoptedStyleSheets 不可用` 的回退提示。
+
+**Q：样式丢失（面板有内容但没排版）？**
+A：说明该浏览器的 `adoptedStyleSheets` 不可用，脚本会回退到 `<style>` 元素；
+若此时站点 CSP 又禁止内联样式，就会没样式。换新版 Chrome/Edge/Firefox（≥101）即可。
+
 ---
 
 ## 七、调试与自测（开发用）
 
 `_test/harness.html` 是一个**本地测试台**：它用桩函数模拟油猴 API
 （`GM_getValue` / `GM_setValue` / `GM_xmlhttpRequest` 等），不装油猴也能验证界面与交互。
+
+> 测试台**常驻开启了 Trusted Types**（页面里带 `require-trusted-types-for 'script'` 的 CSP），
+> 用来保证脚本在严格 CSP 站点上也能正常挂载——曾经的 "浮漂打不开" 就是这类站点造成的。
 
 ```bash
 cd cookie-sync

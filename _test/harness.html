@@ -2,6 +2,9 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
+  <!-- 故意启用 Trusted Types：很多真实站点（尤其带严格 CSP 的）都有这条。
+       测试台常驻开启，用来保证脚本在 require-trusted-types-for 'script' 下也能正常挂载。 -->
+  <meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">
   <title>Cookie Sync · 测试台</title>
   <style>
     body { background:#f8fafc; color:#0f172a; font-family: system-ui, "Microsoft YaHei", sans-serif; padding:40px; margin:0; }
