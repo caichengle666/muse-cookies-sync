@@ -60,6 +60,7 @@
         sameSite: 'unspecified', storeId: '0' },
     ];
     window.__ALL_COOKIES = ALL_COOKIES;
+    window.__setCookies = [];
 
     const probeEarly = new URLSearchParams(location.search).get('probe');
     if (probeEarly !== 'cookie-fallback') {
@@ -78,6 +79,10 @@
           console.log('[harness] GM_cookie.list', JSON.stringify(details), '->', out.length);
           setTimeout(() => cb(out, null), 20);
         },
+        set(details, cb) {
+          window.__setCookies.push(details);
+          setTimeout(() => cb(null), 20);
+        },
       };
     } else {
       // 回退路径：没有 GM_cookie，只有 document.cookie
@@ -87,8 +92,25 @@
     window.GM_notification = (o) => console.log('[harness] notification:', o);
     window.GM_xmlhttpRequest = (o) => {
       console.log('[harness] XHR ->', o.method, o.url);
-      window.__lastXhr = { url: o.url, data: o.data };
-      setTimeout(() => o.onload && o.onload({ status: 200, responseText: '{"ok":true,"received":2}' }), 150);
+      window.__lastXhr = { method: o.method, url: o.url, data: o.data };
+      const responseText = o.method === 'GET'
+        ? JSON.stringify({
+            ok: true,
+            payload: {
+              site: location.hostname,
+              exportedAt: '2026-10-06T00:00:00.000Z',
+              cookies: [
+                { name: 'restored_sid', value: 'server-value', domain: location.hostname, path: '/',
+                  secure: location.protocol === 'https:', httpOnly: true, hostOnly: true, session: true,
+                  expirationDate: null, sameSite: 'lax', storeId: '0' },
+                { name: 'expired', value: 'old', domain: location.hostname, path: '/', secure: false,
+                  httpOnly: false, hostOnly: true, session: false, expirationDate: 1,
+                  sameSite: 'lax', storeId: '0' },
+              ],
+            },
+          })
+        : '{"ok":true,"received":2}';
+      setTimeout(() => o.onload && o.onload({ status: 200, responseText }), 150);
     };
     // 不定义 GM_cookie，走 document.cookie 回退分支
     document.cookie = 'harness_a=1';
@@ -187,6 +209,20 @@
         const probe = params.get('probe');
         say('--- Cookie 采集测试：' + probe + ' ---');
         say('hostname : ' + location.hostname);
+
+        if (probe === 'restore') {
+          sr.querySelector('#restore').click();
+          setTimeout(() => {
+            const x = window.__lastXhr;
+            say('请求方法       : ' + (x && x.method));
+            say('请求含 site    : ' + !!(x && x.url.indexOf('site=' + encodeURIComponent(location.hostname)) >= 0));
+            say('写入数量       : ' + window.__setCookies.length);
+            say('写入名称       : ' + window.__setCookies.map((c) => c.name).join(','));
+            say('过期项已跳过   : ' + !window.__setCookies.some((c) => c.name === 'expired'));
+            window.__finalStatus = lines.join('\n');
+          }, 500);
+          return;
+        }
 
         sr.querySelector('#now').click();
 

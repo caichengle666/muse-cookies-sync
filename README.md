@@ -53,7 +53,7 @@ cookie-sync/
 
 ## 一、启动服务器
 
-需要 Node.js（≥16，无需任何第三方依赖）。
+需要 Node.js（≥18，无需任何第三方依赖）。
 
 ```bash
 cd cookie-sync/server
@@ -83,6 +83,7 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 | `PORT` | `8787` | 监听端口 |
 | `HOST` | `0.0.0.0` | 监听地址；放在反向代理后面时设 `127.0.0.1`，端口就不会直接暴露到公网 |
 | `TOKEN` | 空 | 鉴权令牌；为空则不校验，**生产环境务必设置** |
+| `DATA_DIR` | `server/data` | Cookie 与凭据保存目录 |
 | `LOG_FORMAT` | `text` | 日志格式：`text` 或 `json` |
 | `MAX_SNAPSHOTS_PER_SITE` | `20` | 每个站点保留的快照份数；`0` = 不限 |
 | `RETENTION_DAYS` | `30` | 快照保留天数；`0` = 不按时间清理 |
@@ -105,6 +106,7 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 | --- | --- | --- |
 | GET | `/health` | 健康检查（无需令牌），返回 `{ok,uptimeSec,tokenRequired,time}` |
 | GET | `/api/ping` | 同上，兼容旧调用 |
+| GET | `/api/cookies?site=example.com` | 获取该站点最新 Cookie；设置 `TOKEN` 后需带 `X-Auth-Token` |
 | POST | `/api/cookies` | 接收 Cookie；设置 `TOKEN` 后需带 `X-Auth-Token` |
 | POST | `/api/credentials` | 接收「你本人账号」凭据（`site`/`username`/`password`），同样需令牌 |
 
@@ -145,11 +147,13 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 操作：
 
 - **立即导出** —— 采集当前站点 Cookie 并推送，面板底部显示日志。
+- **从服务器恢复** —— 拉取当前站点最新 Cookie，跳过过期或域名不匹配项并写入浏览器；完成后手动刷新页面。
 - **保存配置** —— 写入油猴存储（`GM_setValue`），下次打开自动生效。
 
 可以通过 Tampermonkey 菜单命令触发：
 
 - `🍪 立即导出当前站点 Cookie`
+- `↩️ 从服务器恢复当前站点 Cookie`
 - `🔑 填入我的登录凭据`
 - `⚙️ 打开面板` —— 浮漂被隐藏时也能调出
 - `🫥 显示 / 隐藏浮漂` —— 快速切换浮漂显隐
@@ -348,6 +352,7 @@ python -m http.server 8899
 #   http://127.0.0.1:8899/_test/harness.html?toggle=1   （验证浮漂显隐开关）
 #   http://127.0.0.1:8899/_test/harness.html?probe=cookie-merge     （验证多域合并去重、字段齐全）
 #   http://127.0.0.1:8899/_test/harness.html?probe=cookie-fallback  （验证 document.cookie 回退的字段缺失标记）
+#   http://127.0.0.1:8899/_test/harness.html?probe=restore          （验证拉取、写入和过期跳过）
 #
 # 注：cookie-merge 用例需要多级域名，可用 Chrome 的 host 映射打开：
 #   chrome --host-resolver-rules="MAP www.test.example.com 127.0.0.1" \

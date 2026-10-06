@@ -2,7 +2,7 @@
 // @name         Cookie Sync · Cookie 同步 & 个人凭据保险箱
 // @name:zh-CN   Cookie 同步 / 个人凭据保险箱
 // @namespace    local.cookie.sync
-// @version      1.5.0
+// @version      1.6.0
 // @description  个人工具：导出当前站点 Cookie（统一字段、多域合并去重）；维护「你自己账号」的登录凭据并可一键填入登录表单，可选同步到你的鉴权服务器；支持隐藏页面浮漂
 // @author       you
 // @match        http://*/*
@@ -243,6 +243,34 @@
     });
   }
 
+  function gmCookieSet(details) {
+    return new Promise((resolve) => {
+      try {
+        if (typeof GM_cookie !== 'undefined' && typeof GM_cookie.set === 'function') {
+          GM_cookie.set(details, (error) => resolve(error ? { ok: false, error: String(error) } : { ok: true }));
+          return;
+        }
+      } catch (e) {
+        resolve({ ok: false, error: e.message || String(e) });
+        return;
+      }
+
+      try {
+        if (typeof GM !== 'undefined' && GM.cookie && typeof GM.cookie.set === 'function') {
+          Promise.resolve(GM.cookie.set(details))
+            .then(() => resolve({ ok: true }))
+            .catch((e) => resolve({ ok: false, error: e.message || String(e) }));
+          return;
+        }
+      } catch (e) {
+        resolve({ ok: false, error: e.message || String(e) });
+        return;
+      }
+
+      resolve({ ok: false, error: 'GM_cookie.set 不可用' });
+    });
+  }
+
   /** 由当前主机名逐级向上列出候选域：www.a.example.com → a.example.com → example.com */
   function candidateDomains() {
     const host = location.hostname;
@@ -320,27 +348,38 @@
   // ---------------------------------------------------------------------------
   // 通用发送
   // ---------------------------------------------------------------------------
-  function postJson(url, payload) {
+  function requestJson(method, url, payload) {
     return new Promise((resolve) => {
       const { authToken } = getCfg();
       const headers = { 'Content-Type': 'application/json' };
       if (authToken) headers['X-Auth-Token'] = authToken;
 
-      dbg('POST', url, payload);
+      dbg(method, url);
 
       GM_xmlhttpRequest({
-        method: 'POST',
+        method,
         url,
         headers,
-        data: JSON.stringify(payload),
+        data: payload === undefined ? undefined : JSON.stringify(payload),
         timeout: 15000,
         onload: (res) => {
           const ok = res.status >= 200 && res.status < 300;
-          dbg('响应', res.status, String(res.responseText).slice(0, 200));
+          dbg('响应', res.status);
+          let data = null;
+          try {
+            data = JSON.parse(res.responseText || 'null');
+          } catch (e) {
+            /* 非 JSON 响应由下面的状态信息处理 */
+          }
           resolve({
             ok,
             status: res.status,
-            message: ok ? null : `服务器返回 ${res.status}：${String(res.responseText).slice(0, 200)}`,
+            data,
+            message: ok
+              ? null
+              : data && data.error
+                ? data.error
+                : `服务器返回 ${res.status}：${String(res.responseText).slice(0, 200)}`,
           });
         },
         onerror: (e) => {
@@ -351,6 +390,9 @@
       });
     });
   }
+
+  const postJson = (url, payload) => requestJson('POST', url, payload);
+  const getJson = (url) => requestJson('GET', url);
 
   // ---------------------------------------------------------------------------
   // 页面级提示浮层（toast） —— 保证任何操作都有可见反馈
@@ -446,6 +488,96 @@
     } catch (err) {
       dbg('导出异常：', err);
       const msg = '导出出错：' + (err && err.message ? err.message : String(err));
+      log(msg, false);
+      toast(msg, 'err');
+      return { ok: false, message: msg };
+    }
+  }
+
+  function cookieBelongsToSite(cookie, site) {
+    const domain = String(cookie.domain || site).replace(/^\./, '').toLowerCase();
+    const host = site.toLowerCase();
+    return host === domain || host.endsWith('.' + domain);
+  }
+
+  async function runRestore() {
+    try {
+      const { serverUrl } = getCfg();
+      if (!serverUrl) {
+        const msg = '未配置服务器地址：请先填写 Cookie 接口地址并保存';
+        log(msg, false);
+        toast(msg, 'err');
+        return { ok: false, message: msg };
+      }
+
+      const site = location.hostname;
+      const pullUrl = new URL(serverUrl);
+      pullUrl.search = '';
+      pullUrl.hash = '';
+      pullUrl.searchParams.set('site', site);
+
+      toast(`正在拉取 ${site} 的 Cookie…`, 'info', 1500);
+      const res = await getJson(pullUrl.toString());
+      const payload = res.data && res.data.payload;
+      if (!res.ok || !payload || !Array.isArray(payload.cookies)) {
+        const msg = res.message || '服务器返回的 Cookie 快照无效';
+        log(msg, false);
+        toast(msg, 'err');
+        return { ok: false, message: msg };
+      }
+      if (String(payload.site || '').toLowerCase() !== site.toLowerCase()) {
+        const msg = `服务器返回站点不匹配：${payload.site || '(空)'}`;
+        log(msg, false);
+        toast(msg, 'err');
+        return { ok: false, message: msg };
+      }
+
+      let applied = 0;
+      let skipped = 0;
+      let failed = 0;
+      const nowSec = Date.now() / 1000;
+
+      for (const cookie of payload.cookies) {
+        if (!cookie || !cookie.name || !cookieBelongsToSite(cookie, site)) {
+          skipped++;
+          continue;
+        }
+        if (typeof cookie.expirationDate === 'number' && cookie.expirationDate <= nowSec) {
+          skipped++;
+          continue;
+        }
+
+        const cookiePath = typeof cookie.path === 'string' && cookie.path.startsWith('/') ? cookie.path : '/';
+        const details = {
+          url: `${cookie.secure ? 'https:' : location.protocol}//${location.host}${cookiePath}`,
+          name: String(cookie.name),
+          value: cookie.value === undefined || cookie.value === null ? '' : String(cookie.value),
+          path: cookiePath,
+        };
+        if (cookie.hostOnly === false && cookie.domain) details.domain = String(cookie.domain);
+        if (typeof cookie.secure === 'boolean') details.secure = cookie.secure;
+        if (typeof cookie.httpOnly === 'boolean') details.httpOnly = cookie.httpOnly;
+        if (typeof cookie.expirationDate === 'number') details.expirationDate = cookie.expirationDate;
+        if (cookie.sameSite) details.sameSite = cookie.sameSite;
+        if (cookie.storeId) details.storeId = cookie.storeId;
+        if (cookie.partitionKey !== undefined) details.partitionKey = cookie.partitionKey;
+
+        const result = await gmCookieSet(details);
+        if (result.ok) applied++;
+        else {
+          failed++;
+          dbg('Cookie 写入失败', cookie.name, result.error);
+        }
+      }
+
+      const ok = applied > 0 && failed === 0;
+      const message = `恢复完成：写入 ${applied}，跳过 ${skipped}，失败 ${failed}；请刷新页面`;
+      log(message, ok);
+      toast(message, ok ? 'ok' : failed ? 'err' : 'info', 6000);
+      return { ok, message, applied, skipped, failed };
+    } catch (err) {
+      const msg = '恢复出错：' + (err && err.message ? err.message : String(err));
+      dbg(msg);
       log(msg, false);
       toast(msg, 'err');
       return { ok: false, message: msg };
@@ -679,7 +811,7 @@
 
       // ---- Cookie 标签 ----
       mk('div', { class: 'tab active', 'data-tab': 'cookie' }, [
-        mk('label', { text: '服务器接口地址（POST）' }),
+        mk('label', { text: '服务器 Cookie 接口地址' }),
         mk('input', {
           type: 'text',
           id: 'url',
@@ -702,6 +834,7 @@
 
         mk('div', { class: 'row' }, [
           mk('button', { class: 'primary', id: 'now', text: '立即导出' }),
+          mk('button', { id: 'restore', text: '从服务器恢复' }),
           mk('button', { id: 'save', text: '保存配置' }),
         ]),
 
@@ -879,6 +1012,11 @@
       runExport({ silent: false });
     });
 
+    root.querySelector('#restore').addEventListener('click', () => {
+      log('开始从服务器恢复…');
+      runRestore();
+    });
+
     // ---- 凭据标签 ----
     const vaultInputs = () => ({
       host: root.querySelector('#v-host').value.trim() || location.hostname,
@@ -995,6 +1133,7 @@
   // 菜单命令
   // ---------------------------------------------------------------------------
   GM_registerMenuCommand('🍪 立即导出当前站点 Cookie', () => runExport({ silent: false }));
+  GM_registerMenuCommand('↩️ 从服务器恢复当前站点 Cookie', () => runRestore());
   GM_registerMenuCommand('🔑 填入我的登录凭据', () => {
     const host = location.hostname;
     const list = getVault()[host] || [];

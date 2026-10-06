@@ -13,6 +13,7 @@
  *                          这样端口不会直接暴露到公网，只由反代访问
  *   TOKEN                  鉴权令牌，为空则不校验（生产环境务必设置）
  *   LOG_FORMAT             日志格式：text（默认）或 json
+ *   DATA_DIR               数据目录，默认 <脚本目录>/data
  *   MAX_SNAPSHOTS_PER_SITE 每站点保留的快照份数，默认 20；0 = 不限
  *   RETENTION_DAYS         快照保留天数，默认 30；0 = 不按时间清理
  *   DEDUP                  相同 Cookie 内容是否跳过重复落盘，默认开；设为 0 关闭
@@ -20,6 +21,7 @@
  * 接口：
  *   GET  /health           健康检查（无需令牌，仅回基础状态）
  *   GET  /api/ping         同上（兼容旧调用）
+ *   GET  /api/cookies      按 site 查询最新 Cookie（需令牌）
  *   POST /api/cookies      接收油猴脚本推送的 Cookie（需带 X-Auth-Token，若设置了 TOKEN）
  *   POST /api/credentials  接收油猴脚本推送的「你本人账号」凭据（同样需令牌）
  *
@@ -46,7 +48,7 @@ const crypto = require('crypto');
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0'; // 反代场景建议设为 127.0.0.1
 const TOKEN = process.env.TOKEN || ''; // 为空则不校验令牌
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 
 const LOG_JSON = (process.env.LOG_FORMAT || 'text').toLowerCase() === 'json';
 const MAX_SNAPSHOTS = intEnv('MAX_SNAPSHOTS_PER_SITE', 20); // 0 = 不限
@@ -108,6 +110,10 @@ function readBody(req, limit = 5 * 1024 * 1024) {
 
 function safeName(host) {
   return String(host || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+function validSite(site) {
+  return typeof site === 'string' && site.length > 0 && site.length <= 253 && !/[\\/\0]/.test(site);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,14 +267,38 @@ const server = http.createServer(async (req, res) => {
     return true;
   };
 
+  if (req.method === 'GET' && url.pathname === '/api/cookies') {
+    if (!checkToken()) return;
+
+    const site = url.searchParams.get('site');
+    if (!validSite(site)) {
+      return send(res, 400, { ok: false, error: 'site 参数无效' });
+    }
+
+    const file = path.join(DATA_DIR, `latest-${safeName(site)}.json`);
+    try {
+      const payload = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (payload.site !== site || !Array.isArray(payload.cookies)) {
+        return send(res, 409, { ok: false, error: '最新快照内容无效或站点不匹配' });
+      }
+      return send(res, 200, { ok: true, payload });
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        return send(res, 404, { ok: false, error: `没有 ${site} 的 Cookie 快照` });
+      }
+      log('error', 'cookies read failed', { site, msg: err.message });
+      return send(res, 500, { ok: false, error: '读取 Cookie 快照失败' });
+    }
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/cookies') {
     if (!checkToken()) return;
 
     try {
       const raw = await readBody(req);
       const payload = JSON.parse(raw || '{}');
-      if (!payload || !Array.isArray(payload.cookies)) {
-        return send(res, 400, { ok: false, error: 'payload.cookies 必须是数组' });
+      if (!payload || !validSite(payload.site) || !Array.isArray(payload.cookies)) {
+        return send(res, 400, { ok: false, error: 'payload.site 无效或 payload.cookies 不是数组' });
       }
 
       const { duplicate } = persist(payload);

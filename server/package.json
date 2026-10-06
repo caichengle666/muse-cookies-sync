@@ -6,9 +6,10 @@
   "main": "receiver.js",
   "scripts": {
     "start": "node receiver.js",
-    "dev": "node receiver.js"
+    "dev": "node receiver.js",
+    "test": "node --test receiver.test.js"
   },
   "engines": {
-    "node": ">=16"
+    "node": ">=18"
   }
 }
