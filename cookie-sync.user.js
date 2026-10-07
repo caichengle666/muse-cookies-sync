@@ -819,11 +819,11 @@
           value: cfg.serverUrl,
         }),
 
-        mk('label', { text: '鉴权令牌 X-Auth-Token（可选）' }),
+        mk('label', { text: '鉴权令牌 X-Auth-Token（必填）' }),
         mk('input', {
           type: 'password',
           id: 'token',
-          placeholder: '留空则不带令牌',
+          placeholder: '填写服务端 TOKEN',
           value: cfg.authToken,
         }),
 

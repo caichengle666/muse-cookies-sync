@@ -59,7 +59,7 @@ cookie-sync/
 ```bash
 cd cookie-sync/server
 
-# 默认端口 8787，无令牌
+# 默认端口 8787，仅监听本机；TOKEN 必填
 node receiver.js
 
 # 启用令牌 + 自定义端口（推荐）
@@ -70,6 +70,8 @@ set PORT=9000&& set TOKEN=mysecret&& node receiver.js
 # Windows PowerShell
 $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 ```
+
+配置好 `TOKEN` 并启动后，可打开 `http://<服务器地址>:<端口>/admin` 查看已保存的 Cookie 快照。管理页使用与油猴客户端相同的 `TOKEN`，以 `X-Auth-Token` 请求服务端；令牌只保存在当前浏览器标签页会话中。Cookie 值默认隐藏，点击“显示”后才会展开。管理页为只读，不提供密码凭据展示。
 
 启动后输出（默认 `text` 格式；设 `LOG_FORMAT=json` 则输出 JSON 行）：
 
@@ -82,8 +84,8 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `8787` | 监听端口 |
-| `HOST` | `0.0.0.0` | 监听地址；放在反向代理后面时设 `127.0.0.1`，端口就不会直接暴露到公网 |
-| `TOKEN` | 空 | 鉴权令牌；为空则不校验，**生产环境务必设置** |
+| `HOST` | `127.0.0.1` | 监听地址；远程部署应通过 HTTPS 反向代理访问 |
+| `TOKEN` | 无 | 必填鉴权令牌；未设置时服务拒绝启动 |
 | `DATA_DIR` | `server/data` | Cookie 与凭据保存目录 |
 | `LOG_FORMAT` | `text` | 日志格式：`text` 或 `json` |
 | `MAX_SNAPSHOTS_PER_SITE` | `20` | 每个站点保留的快照份数；`0` = 不限 |
@@ -107,6 +109,8 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 | --- | --- | --- |
 | GET | `/health` | 健康检查（无需令牌），返回 `{ok,uptimeSec,tokenRequired,time}` |
 | GET | `/api/ping` | 同上，兼容旧调用 |
+| GET | `/admin` | 只读管理页；仅在设置 `TOKEN` 后可读取 Cookie 数据 |
+| GET | `/api/sites` | 获取已保存快照的站点、时间和 Cookie 数量；必须带 `X-Auth-Token`，且服务端必须设置 `TOKEN` |
 | GET | `/api/cookies?site=example.com` | 获取该站点最新 Cookie；设置 `TOKEN` 后需带 `X-Auth-Token` |
 | POST | `/api/cookies` | 接收 Cookie；设置 `TOKEN` 后需带 `X-Auth-Token` |
 | POST | `/api/credentials` | 接收「你本人账号」凭据（`site`/`username`/`password`），同样需令牌 |
@@ -135,7 +139,7 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 | 项 | 说明 |
 | --- | --- |
 | **服务器接口地址** | 填 `http://<你的服务器IP>:<端口>/api/cookies`。本机测试填 `http://127.0.0.1:8787/api/cookies` |
-| **鉴权令牌** | 与服务端启动时的 `TOKEN` 一致；留空表示不带令牌 |
+| **鉴权令牌** | 必填，与服务端启动时的 `TOKEN` 一致 |
 | **自动导出** | 勾选后每次打开页面自动推送当前站点 Cookie |
 
 面板底部还有两个通用控件：

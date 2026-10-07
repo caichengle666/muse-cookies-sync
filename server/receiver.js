@@ -9,9 +9,8 @@
  *
  * 环境变量：
  *   PORT                   监听端口，默认 8787
- *   HOST                   监听地址，默认 0.0.0.0；放在反向代理后面时建议设为 127.0.0.1，
- *                          这样端口不会直接暴露到公网，只由反代访问
- *   TOKEN                  鉴权令牌，为空则不校验（生产环境务必设置）
+ *   HOST                   监听地址，默认 127.0.0.1；需要远程访问时使用 HTTPS 反向代理
+ *   TOKEN                  必填鉴权令牌
  *   LOG_FORMAT             日志格式：text（默认）或 json
  *   DATA_DIR               数据目录，默认 <脚本目录>/data
  *   MAX_SNAPSHOTS_PER_SITE 每站点保留的快照份数，默认 20；0 = 不限
@@ -46,9 +45,14 @@ const crypto = require('crypto');
 // 配置
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT || '8787', 10);
-const HOST = process.env.HOST || '0.0.0.0'; // 反代场景建议设为 127.0.0.1
-const TOKEN = process.env.TOKEN || ''; // 为空则不校验令牌
+const HOST = process.env.HOST || '127.0.0.1';
+const TOKEN = process.env.TOKEN || '';
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
+
+if (!TOKEN.trim()) {
+  process.stderr.write('TOKEN is required; refusing to start without API authentication.\n');
+  process.exit(1);
+}
 
 const LOG_JSON = (process.env.LOG_FORMAT || 'text').toLowerCase() === 'json';
 const MAX_SNAPSHOTS = intEnv('MAX_SNAPSHOTS_PER_SITE', 20); // 0 = 不限
@@ -60,7 +64,14 @@ function intEnv(name, def) {
   return Number.isFinite(v) && v >= 0 ? v : def;
 }
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+if (process.platform !== 'win32') fs.chmodSync(DATA_DIR, 0o700);
+
+function writePrivateFile(file, content, append = false) {
+  if (append) fs.appendFileSync(file, content, { mode: 0o600 });
+  else fs.writeFileSync(file, content, { mode: 0o600 });
+  if (process.platform !== 'win32') fs.chmodSync(file, 0o600);
+}
 
 // ---------------------------------------------------------------------------
 // 日志（text / json 两种格式，统一走 stdout 交给 systemd、PM2、Docker 收集）
@@ -193,13 +204,10 @@ function persist(payload) {
   lastFingerprint.set(payload.site, fp);
 
   if (!duplicate) {
-    fs.writeFileSync(
-      path.join(DATA_DIR, `cookies-${host}-${ts}.json`),
-      JSON.stringify(payload, null, 2)
-    );
-    fs.appendFileSync(path.join(DATA_DIR, 'cookies.jsonl'), JSON.stringify(payload) + '\n');
+    writePrivateFile(path.join(DATA_DIR, `cookies-${host}-${ts}.json`), JSON.stringify(payload, null, 2));
+    writePrivateFile(path.join(DATA_DIR, 'cookies.jsonl'), JSON.stringify(payload) + '\n', true);
   }
-  fs.writeFileSync(path.join(DATA_DIR, `latest-${host}.json`), JSON.stringify(payload, null, 2));
+  writePrivateFile(path.join(DATA_DIR, `latest-${host}.json`), JSON.stringify(payload, null, 2));
 
   prune();
   return { duplicate };
@@ -229,7 +237,7 @@ function persistCredential(payload) {
   else store.entries.push(entry);
 
   store.updatedAt = entry.updatedAt;
-  fs.writeFileSync(file, JSON.stringify(store, null, 2));
+  writePrivateFile(file, JSON.stringify(store, null, 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +254,19 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url, `http://${req.headers.host}`);
 
+  if (req.method === 'GET' && url.pathname === '/admin') {
+    const html = fs.readFileSync(path.join(__dirname, 'admin.html'));
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'no-referrer',
+    });
+    res.end(html);
+    return;
+  }
+
   // 健康检查：不校验令牌，只回基础状态（不含任何数据）
   if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/api/ping')) {
     return send(res, 200, {
@@ -257,15 +278,42 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // 令牌校验（仅在设置了环境变量 TOKEN 时启用）
+  // 令牌校验
   const checkToken = () => {
-    if (TOKEN && req.headers['x-auth-token'] !== TOKEN) {
+    if (req.headers['x-auth-token'] !== TOKEN) {
       log('warn', 'rejected', { reason: 'bad token', path: url.pathname, ip: req.socket.remoteAddress });
       send(res, 401, { ok: false, error: 'unauthorized: X-Auth-Token 不正确' });
       return false;
     }
     return true;
   };
+
+  if (req.method === 'GET' && url.pathname === '/api/sites') {
+    if (!checkToken()) return;
+
+    const sites = [];
+    try {
+      for (const name of fs.readdirSync(DATA_DIR)) {
+        if (!/^latest-.+\.json$/.test(name)) continue;
+        try {
+          const payload = JSON.parse(fs.readFileSync(path.join(DATA_DIR, name), 'utf8'));
+          if (!validSite(payload.site) || !Array.isArray(payload.cookies)) continue;
+          sites.push({
+            site: payload.site,
+            exportedAt: payload.exportedAt || null,
+            cookieCount: payload.cookies.length,
+          });
+        } catch (err) {
+          log('warn', 'site snapshot skipped', { file: name, msg: err.message });
+        }
+      }
+      sites.sort((a, b) => a.site.localeCompare(b.site));
+      return send(res, 200, { ok: true, sites });
+    } catch (err) {
+      log('error', 'site list failed', { msg: err.message });
+      return send(res, 500, { ok: false, error: '读取站点列表失败' });
+    }
+  }
 
   if (req.method === 'GET' && url.pathname === '/api/cookies') {
     if (!checkToken()) return;

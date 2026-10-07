@@ -7,8 +7,7 @@
 //   pm2 startup              # 生成开机自启命令，按提示执行
 //   pm2 logs cookie-sync     # 看日志
 //
-// 注意：本文件里写 TOKEN 会进 Git，建议改用 .env + dotenv，
-//       或设置环境变量后删除下面的 env 段。生产推荐直接用 systemd 方案。
+// 注意：通过 PM2 启动前必须在进程环境中提供 TOKEN；不要把真实令牌写入此文件。
 // ---------------------------------------------------------------
 
 module.exports = {
@@ -23,7 +22,6 @@ module.exports = {
       env: {
         PORT: 8787,
         HOST: '127.0.0.1', // 放在 Nginx 后面，只监听本机
-        TOKEN: 'REPLACE_WITH_openssl_rand_hex_32',
       },
 
       autorestart: true,

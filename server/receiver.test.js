@@ -54,6 +54,18 @@ test('GET /api/cookies requires authentication', async () => {
   assert.equal(res.status, 401);
 });
 
+test('GET /api/sites requires the shared API token', async () => {
+  const res = await fetch(`${BASE_URL}/api/sites`);
+  assert.equal(res.status, 401);
+});
+
+test('GET /admin serves the read-only management page', async () => {
+  const res = await fetch(`${BASE_URL}/admin`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /text\/html/);
+  assert.match(await res.text(), /X-Auth-Token/);
+});
+
 test('uploaded cookies can be fetched by site', async () => {
   const payload = {
     site: 'example.com',
@@ -73,6 +85,15 @@ test('uploaded cookies can be fetched by site', async () => {
   });
   assert.equal(download.status, 200);
   assert.deepEqual(await download.json(), { ok: true, payload });
+
+  const sites = await fetch(`${BASE_URL}/api/sites`, {
+    headers: { 'X-Auth-Token': TOKEN },
+  });
+  assert.equal(sites.status, 200);
+  assert.deepEqual(await sites.json(), {
+    ok: true,
+    sites: [{ site: 'example.com', exportedAt: payload.exportedAt, cookieCount: 1 }],
+  });
 });
 
 test('GET /api/cookies reports a missing site snapshot', async () => {

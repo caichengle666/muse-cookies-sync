@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cookie Sync 管理</title>
+  <style>
+    :root { color-scheme: dark; font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif; color: #e2e8f0; background: #0f172a; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 24px; background: #1e293b; border-bottom: 1px solid #334155; }
+    h1 { margin: 0; font-size: 18px; color: #f8fafc; }
+    main { max-width: 1120px; margin: 0 auto; padding: 24px; }
+    form, .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    form { padding-bottom: 20px; border-bottom: 1px solid #334155; }
+    input, select, button { min-height: 38px; border: 1px solid #334155; border-radius: 6px; background: #0f172a; color: #e2e8f0; font: inherit; padding: 7px 10px; }
+    input { width: min(420px, 100%); }
+    button { cursor: pointer; }
+    button:hover { background: #1e293b; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #3b82f6; outline-offset: 2px; }
+    form button[type="submit"] { background: #2563eb; border-color: #2563eb; color: #fff; }
+    form button[type="submit"]:hover { background: #1d4ed8; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    #status { min-height: 24px; margin: 14px 0; color: #94a3b8; }
+    #status.error { color: #fca5a5; }
+    .toolbar { justify-content: space-between; margin: 18px 0 12px; }
+    .meta { color: #94a3b8; }
+    .table-wrap { overflow-x: auto; background: #1e293b; border: 1px solid #334155; border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #334155; vertical-align: top; }
+    th { background: #0f172a; color: #f8fafc; font-weight: 600; white-space: nowrap; }
+    tr:last-child td { border-bottom: 0; }
+    td.value { min-width: 220px; overflow-wrap: anywhere; font-family: ui-monospace, monospace; }
+    .empty { padding: 22px 12px; color: #94a3b8; }
+    @media (max-width: 600px) { header { padding: 14px 16px; } main { padding: 16px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Cookie Sync 管理</h1>
+    <button id="logout" type="button" hidden>退出</button>
+  </header>
+  <main>
+    <form id="login">
+      <label for="token">服务端 TOKEN</label>
+      <input id="token" type="password" autocomplete="current-password" required>
+      <button type="submit">连接</button>
+    </form>
+    <p id="status" role="status">输入服务端启动时配置的 TOKEN。令牌只保存在当前标签页会话中。</p>
+    <section id="content" hidden>
+      <div class="toolbar">
+        <label>站点 <select id="sites"></select></label>
+        <span id="snapshot-meta" class="meta"></span>
+        <button id="refresh" type="button">刷新</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>名称</th><th>域名</th><th>路径</th><th>属性</th><th>值</th></tr></thead>
+          <tbody id="cookies"></tbody>
+        </table>
+        <div id="empty" class="empty" hidden>该站点没有 Cookie。</div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const tokenInput = document.querySelector('#token');
+    const loginForm = document.querySelector('#login');
+    const logoutButton = document.querySelector('#logout');
+    const content = document.querySelector('#content');
+    const siteSelect = document.querySelector('#sites');
+    const cookieBody = document.querySelector('#cookies');
+    const empty = document.querySelector('#empty');
+    const status = document.querySelector('#status');
+    const tokenKey = 'cookie-sync-admin-token';
+    let token = '';
+
+    function setStatus(message, error = false) {
+      status.textContent = message;
+      status.classList.toggle('error', error);
+    }
+
+    async function api(url) {
+      const response = await fetch(url, { headers: { 'X-Auth-Token': token } });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '请求失败');
+      return result;
+    }
+
+    function cell(row, value) {
+      const td = document.createElement('td');
+      td.textContent = value == null || value === '' ? '-' : String(value);
+      row.append(td);
+      return td;
+    }
+
+    function renderCookies(cookies) {
+      cookieBody.replaceChildren();
+      empty.hidden = cookies.length > 0;
+      for (const cookie of cookies) {
+        const row = document.createElement('tr');
+        cell(row, cookie.name);
+        cell(row, cookie.domain);
+        cell(row, cookie.path || '/');
+        cell(row, [
+          cookie.secure ? 'Secure' : '',
+          cookie.httpOnly ? 'HttpOnly' : '',
+          cookie.sameSite ? 'SameSite=' + cookie.sameSite : '',
+          cookie.expirationDate ? '到期 ' + new Date(cookie.expirationDate * 1000).toLocaleString() : '会话 Cookie',
+        ].filter(Boolean).join(' · '));
+        const valueCell = document.createElement('td');
+        valueCell.className = 'value';
+        const value = document.createElement('span');
+        value.textContent = '••••••';
+        const reveal = document.createElement('button');
+        reveal.type = 'button';
+        reveal.textContent = '显示';
+        reveal.setAttribute('aria-label', '显示 ' + String(cookie.name || 'Cookie') + ' 的值');
+        reveal.addEventListener('click', () => {
+          const visible = reveal.dataset.visible === 'true';
+          value.textContent = visible ? '••••••' : String(cookie.value || '');
+          reveal.textContent = visible ? '显示' : '隐藏';
+          reveal.dataset.visible = String(!visible);
+        });
+        valueCell.append(value, ' ', reveal);
+        row.append(valueCell);
+        cookieBody.append(row);
+      }
+    }
+
+    async function loadSites(preferredSite) {
+      setStatus('正在读取站点列表…');
+      try {
+        const result = await api('/api/sites');
+        siteSelect.replaceChildren();
+        for (const item of result.sites) {
+          const option = document.createElement('option');
+          option.value = item.site;
+          option.textContent = item.site + ' (' + item.cookieCount + ')';
+          siteSelect.append(option);
+        }
+        content.hidden = false;
+        loginForm.hidden = true;
+        logoutButton.hidden = false;
+        if (!result.sites.length) {
+          document.querySelector('#snapshot-meta').textContent = '';
+          renderCookies([]);
+          setStatus('连接成功，服务器上还没有 Cookie 快照。');
+          return;
+        }
+        if (preferredSite && result.sites.some((item) => item.site === preferredSite)) {
+          siteSelect.value = preferredSite;
+        }
+        await loadSelectedSite();
+        setStatus('已连接。Cookie 值默认隐藏，查看时再单独显示。');
+      } catch (error) {
+        sessionStorage.removeItem(tokenKey);
+        token = '';
+        content.hidden = true;
+        loginForm.hidden = false;
+        logoutButton.hidden = true;
+        setStatus(error.message, true);
+      }
+    }
+
+    async function loadSelectedSite() {
+      const site = siteSelect.value;
+      if (!site) return;
+      try {
+        const result = await api('/api/cookies?site=' + encodeURIComponent(site));
+        const payload = result.payload;
+        document.querySelector('#snapshot-meta').textContent =
+          (payload.exportedAt ? '快照时间：' + new Date(payload.exportedAt).toLocaleString() : '快照时间未知') +
+          ' · ' + payload.cookies.length + ' 个 Cookie';
+        renderCookies(payload.cookies);
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    loginForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      token = tokenInput.value;
+      sessionStorage.setItem(tokenKey, token);
+      await loadSites();
+    });
+    siteSelect.addEventListener('change', loadSelectedSite);
+    document.querySelector('#refresh').addEventListener('click', () => loadSites(siteSelect.value));
+    logoutButton.addEventListener('click', () => {
+      sessionStorage.removeItem(tokenKey);
+      token = '';
+      content.hidden = true;
+      loginForm.hidden = false;
+      logoutButton.hidden = true;
+      tokenInput.value = '';
+      setStatus('已退出。');
+    });
+
+    token = sessionStorage.getItem(tokenKey) || '';
+    if (token) loadSites();
+  </script>
+</body>
+</html>
