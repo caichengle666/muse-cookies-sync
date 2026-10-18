@@ -30,6 +30,7 @@ cookie-sync/
 │   └── cookie-sync.env.example  # 环境变量模板
 ├── _test/
 │   ├── harness.html             # 本地测试台（桩掉 GM_* API）
+│   ├── userscript.test.js       # 油猴脚本离线测试（node:vm + GM 桩 + 假 DOM）
 │   └── preview-*.png            # 界面截图
 └── README.md
 ```
@@ -98,6 +99,7 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 - **去重**：内容指纹只看「站点 + Cookie 集合」，忽略 `exportedAt` 这类每次都变的字段。内容没变就不再写快照和 `cookies.jsonl`，响应里带 `duplicate:true`；`latest-<host>.json` 仍会刷新。
 - **保留策略**：每次写入后按 `MAX_SNAPSHOTS_PER_SITE` 与 `RETENTION_DAYS` 清理旧快照（启动时也清一遍），避免 `data/` 无限增长。
 - **优雅退出**：收到 `SIGTERM` / `SIGINT` 后停止接收新请求、写完在途数据再退出，5 秒兜底强退。systemd 重启、`docker stop` 都能安全收尾。
+- **不支持 CORS**：服务端不发送任何 `Access-Control-*` 响应头，`OPTIONS` 预检一律返回 `405`。油猴脚本用 `GM_xmlhttpRequest`（不受同源策略限制），`/admin` 是同源访问，都不需要 CORS；这样普通网页无法跨域读取接口响应。
 - **日志**：统一走 stdout（交给 systemd / PM2 / Docker 收集），可选 JSON 便于采集；鉴权失败会记录来源 IP。
 
 **部署到远程服务器时**，记得在云厂商安全组 / 防火墙上放行对应端口，
@@ -139,7 +141,7 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 | 项 | 说明 |
 | --- | --- |
 | **服务器接口地址** | 填 `http://<你的服务器IP>:<端口>/api/cookies`。本机测试填 `http://127.0.0.1:8787/api/cookies` |
-| **鉴权令牌** | 必填，与服务端启动时的 `TOKEN` 一致 |
+| **鉴权令牌** | 必填，与服务端启动时的 `TOKEN` 一致。保存后**不会回显**到输入框（页面 DOM 中不保留令牌）；之后留空点「保存配置」即保留原令牌，填写新值才会替换 |
 | **自动导出** | 勾选后每次打开页面自动推送当前站点 Cookie |
 
 面板底部还有两个通用控件：
@@ -199,8 +201,22 @@ $env:PORT=9000; $env:TOKEN="mysecret"; node receiver.js
 ```
 { url: 当前地址 }
 { domain: www.example.com }     ← 逐级向上（最多 4 级；IP 地址不做父域推断）
-{ domain: example.com }
+{ domain: example.com }         ← 到注册域为止，不会再查 com
 ```
+
+**父域查询不越过注册域**：脚本内置了常见多级公共后缀（`com.cn`、`co.uk`、`co.jp`、`com.au`
+等国家二级后缀，以及 `github.io`、`pages.dev`、`vercel.app`、`netlify.app` 等托管平台），
+例如 `alice.github.io` 只查 `alice.github.io`，`www.shop.com.cn` 只查到 `shop.com.cn`。
+这不是完整的 Public Suffix List，未收录的后缀按单级 TLD 处理。
+
+**按 Cookie 域匹配规则过滤**：`{ domain: example.com }` 会连带返回 `other.example.com` 等兄弟子域的 Cookie，
+它们并不会发给当前站点。所以每条结果都会再过一遍浏览器的域匹配规则，不匹配的直接丢弃：
+
+- `hostOnly: true`：`domain` 必须与当前主机名完全相同；
+- 其余：当前主机 `h` 与 Cookie 域 `d`（去掉开头的点）满足 `h === d` 或 `h.endsWith('.' + d)`，
+  且 `d` 不能是公共后缀（`.github.io`、`.com.cn` 这类一律丢弃）。
+
+被丢弃的条数记在 `sources` 里的 `filtered=N`。
 
 去重键是 `name + domain + path + partitionKey`——同名 Cookie 若归属域或 path 不同，
 本就是两条不同的 Cookie，都会保留。
@@ -277,7 +293,8 @@ payload 里的 `sources` 会记录每次查询各命中多少条，排查「为�
 3. 点 **保存到本地** —— 写入本机油猴存储（Base64 混淆，非强加密）；
 4. 点 **上传到服务器** —— 推送到 `/api/credentials`（复用 Cookie 标签页里的地址与令牌）；
 5. 在已存列表里点 **填入**（或菜单命令 `🔑 填入我的登录凭据`）—— 脚本会在当前页面定位
-   登录输入框并填入，**不会自动提交**，由你手动点登录；
+   登录输入框并填入，**不会自动提交**，由你手动点登录。**只能填入当前站点的凭据**：
+   「网站」改成别的域名时可以查看/删除该站点的条目，但「填入」按钮会禁用；
 6. 点 **删除** 移除某条凭据。
 
 **它做什么 / 不做什么**
@@ -287,6 +304,12 @@ payload 里的 `sources` 会记录每次查询各命中多少条，排查「为�
 | 保存你自己填写的凭据 | 收集页面上他人输入的凭据 |
 | 你点按钮后填入当前页面的登录框 | 后台静默抓取表单 |
 | 上传到你自己的鉴权服务器 | 伪装成目标网站自己的登录框 |
+
+**面板隔离**
+
+- 面板和提示浮层都挂在 `closed` 模式的 Shadow DOM 里，页面脚本拿不到 `shadowRoot`，读不到服务器地址和凭据列表；
+- 所有按钮/开关只响应真实用户操作（`event.isTrusted`），页面脚本用 `dispatchEvent` / `el.click()` 伪造的事件一律忽略；
+- 令牌输入框是密码框，且从不把已保存的令牌写回 DOM。
 
 **安全提示**
 
@@ -342,6 +365,18 @@ A：说明该浏览器的 `adoptedStyleSheets` 不可用，脚本会回退到 `<
 
 `_test/harness.html` 是一个**本地测试台**：它用桩函数模拟油猴 API
 （`GM_getValue` / `GM_setValue` / `GM_xmlhttpRequest` 等），不装油猴也能验证界面与交互。
+
+**离线自动化测试**（推荐，无需浏览器）：`_test/userscript.test.js` 用 `node:vm` 沙箱 + GM 桩 + 极简假 DOM
+加载脚本，覆盖 closed shadowRoot、令牌不回显、`isTrusted` 校验、「填入」仅限当前站点、Cookie 域过滤与注册域边界。
+它已并入服务端的 `npm test`：
+
+```bash
+cd server && npm test          # = node --test receiver.test.js ../_test/userscript.test.js
+```
+
+> 注意：面板改为 `closed` Shadow DOM 且按钮只认 `isTrusted` 事件后，测试台里**自动派发的点击会被脚本忽略**
+> （这正是预期的防护效果）。测试台通过在加载脚本前包装 `attachShadow` 拿到面板根节点，
+> 仍可检查挂载与界面；按钮交互请手动点击，逻辑校验以上面的离线测试为准。
 
 > 测试台**常驻开启了 Trusted Types**（页面里带 `require-trusted-types-for 'script'` 的 CSP），
 > 用来保证脚本在严格 CSP 站点上也能正常挂载——曾经的 "浮漂打不开" 就是这类站点造成的。
