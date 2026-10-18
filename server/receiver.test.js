@@ -103,3 +103,37 @@ test('GET /api/cookies reports a missing site snapshot', async () => {
   assert.equal(res.status, 404);
 });
 
+
+test('OPTIONS preflight is rejected with 405 and no CORS headers', async () => {
+  for (const p of ['/api/cookies', '/api/sites', '/api/credentials', '/health']) {
+    const res = await fetch(`${BASE_URL}${p}`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://evil.example',
+        'Access-Control-Request-Method': 'GET',
+        'Access-Control-Request-Headers': 'x-auth-token',
+      },
+    });
+    assert.equal(res.status, 405, p);
+    for (const [k] of res.headers) assert.ok(!k.startsWith('access-control-'), `${p} 不应返回 ${k}`);
+    await res.arrayBuffer();
+  }
+});
+
+test('API responses carry no Access-Control-* headers', async () => {
+  const reqs = [
+    fetch(`${BASE_URL}/health`, { headers: { Origin: 'https://evil.example' } }),
+    fetch(`${BASE_URL}/api/sites`, { headers: { Origin: 'https://evil.example', 'X-Auth-Token': TOKEN } }),
+    fetch(`${BASE_URL}/api/cookies?site=example.com`, { headers: { Origin: 'https://evil.example' } }),
+    fetch(`${BASE_URL}/admin`, { headers: { Origin: 'https://evil.example' } }),
+    fetch(`${BASE_URL}/api/cookies`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Auth-Token': TOKEN, Origin: 'https://evil.example' },
+      body: JSON.stringify({ site: 'cors.example', cookies: [] }),
+    }),
+  ];
+  for (const res of await Promise.all(reqs)) {
+    for (const [k] of res.headers) assert.ok(!k.startsWith('access-control-'), `${res.url} 不应返回 ${k}`);
+    await res.arrayBuffer();
+  }
+});
