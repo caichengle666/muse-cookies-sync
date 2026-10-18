@@ -89,15 +89,11 @@ function log(level, msg, fields) {
 // ---------------------------------------------------------------------------
 // HTTP 小工具
 // ---------------------------------------------------------------------------
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, X-Auth-Token',
-};
-
-function send(res, status, obj) {
+// 不发送任何 CORS 头：油猴脚本走 GM_xmlhttpRequest（不受同源策略约束），/admin 是同源访问，
+// 都不需要 CORS。开着 Access-Control-Allow-Origin: * 只会让任意网页能跨域读取接口响应。
+function send(res, status, obj, extraHeaders) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...CORS });
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...(extraHeaders || {}) });
   res.end(body);
 }
 
@@ -246,10 +242,9 @@ function persistCredential(payload) {
 const startedAt = Date.now();
 
 const server = http.createServer(async (req, res) => {
+  // 不支持 CORS 预检：OPTIONS 一律 405（不带任何 Access-Control-* 头，浏览器的跨域预检会失败）
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, CORS);
-    res.end();
-    return;
+    return send(res, 405, { ok: false, error: 'method not allowed' }, { Allow: 'GET, POST' });
   }
 
   const url = new URL(req.url, `http://${req.headers.host}`);
