@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node receiver.js",
     "dev": "node receiver.js",
-    "test": "node --test receiver.test.js"
+    "test": "node --test receiver.test.js ../_test/userscript.test.js"
   },
   "engines": {
     "node": ">=18"
