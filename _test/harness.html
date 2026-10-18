@@ -116,6 +116,17 @@
     document.cookie = 'harness_a=1';
     document.cookie = 'harness_b=2';
 
+    // 脚本把面板挂在 closed shadowRoot 上（host.shadowRoot 为 null）。测试台在加载脚本前包装
+    // attachShadow，把根节点记到 WeakMap 里，仅用于检查挂载与界面。注意：脚本的按钮只认
+    // isTrusted 事件，这里用 dispatchEvent / click() 派发的事件会被忽略（预期行为）。
+    window.__shadowRoots = new WeakMap();
+    const origAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function (init) {
+      const r = origAttachShadow.call(this, init);
+      window.__shadowRoots.set(this, r);
+      return r;
+    };
+
     window.__log = [];
     const origLog = console.log;
     console.log = (...a) => { window.__log.push(a.map(String).join(' ')); origLog(...a); };
@@ -143,7 +154,7 @@
     const timer = setInterval(() => {
       tries++;
       const host = document.getElementById('cookie-sync-host');
-      if (!host || !host.shadowRoot) {
+      if (!host || !window.__shadowRoots.get(host)) {
         if (tries > 50) { clearInterval(timer); say('❌ 浮漂未挂载（host 或 shadowRoot 缺失）'); }
         return;
       }
@@ -151,7 +162,9 @@
       say('✅ 浮漂浮层已挂载 #cookie-sync-host');
       say('   位置: ' + host.style.left + ',' + host.style.top + ' (right=' + host.style.right + ')');
 
-      const sr = host.shadowRoot;
+      const sr = window.__shadowRoots.get(host);
+      say('   shadowRoot 模式: ' + sr.mode + '（host.shadowRoot = ' + host.shadowRoot + '）');
+      say('   ⚠️ 下面自动派发的点击 isTrusted=false，会被脚本忽略；交互请手动点击');
       const ball = sr.querySelector('.btn');
       say('✅ 浮漂按钮存在: ' + !!ball);
 
@@ -284,8 +297,9 @@
       setTimeout(() => {
         const th = document.getElementById('cookie-sync-toast-host');
         let t = '';
-        if (th && th.shadowRoot) {
-          const items = th.shadowRoot.querySelectorAll('.t');
+        const thRoot = th && window.__shadowRoots.get(th);
+        if (thRoot) {
+          const items = thRoot.querySelectorAll('.t');
           t = Array.from(items).map((x) => x.textContent).join(' | ');
         }
         say('--- 结果 ---');
