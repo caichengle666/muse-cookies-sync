@@ -2,7 +2,7 @@
 // @name         Cookie Sync · Cookie 同步 & 个人凭据保险箱
 // @name:zh-CN   Cookie 同步 / 个人凭据保险箱
 // @namespace    local.cookie.sync
-// @version      1.6.0
+// @version      1.6.1
 // @description  个人工具：导出当前站点 Cookie（统一字段、多域合并去重）；维护「你自己账号」的登录凭据并可一键填入登录表单，可选同步到你的鉴权服务器；支持隐藏页面浮漂
 // @author       you
 // @match        http://*/*
@@ -271,18 +271,87 @@
     });
   }
 
-  /** 由当前主机名逐级向上列出候选域：www.a.example.com → a.example.com → example.com */
-  function candidateDomains() {
-    const host = location.hostname;
+  /**
+   * 常见多级公共后缀（非完整 PSL，仅覆盖日常会遇到的）。
+   * 作用：父域查询**不能越过注册域**——否则 `a.github.io` 会去查 `github.io`，
+   * 把别人站点（`b.github.io`）的 Cookie 一起捞出来；`x.foo.com.cn` 同理。
+   */
+  const MULTI_LEVEL_SUFFIXES = new Set([
+    // 国家/地区二级后缀
+    'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
+    'co.uk', 'org.uk', 'me.uk', 'gov.uk', 'ac.uk',
+    'co.jp', 'ne.jp', 'or.jp', 'ac.jp',
+    'co.kr', 'or.kr',
+    'com.tw', 'com.hk', 'com.sg', 'com.my', 'com.ph',
+    'com.au', 'net.au', 'org.au', 'co.nz',
+    'com.br', 'com.mx', 'com.ar', 'com.tr', 'com.ua', 'com.ru',
+    'co.in', 'co.il', 'co.za', 'co.id', 'co.th', 'com.vn',
+    // 常见托管平台（同一后缀下是互不信任的不同站点）
+    'github.io', 'gitlab.io', 'pages.dev', 'workers.dev', 'r2.dev',
+    'vercel.app', 'netlify.app', 'herokuapp.com', 'firebaseapp.com', 'web.app',
+    'appspot.com', 'azurewebsites.net', 'cloudfront.net', 'blogspot.com',
+    'glitch.me', 'onrender.com', 'fly.dev', 'surge.sh', 'sourceforge.io',
+  ]);
+
+  const isIpHost = (host) => /^\d+(\.\d+){3}$/.test(host) || host.includes(':');
+
+  /** 该域本身就是公共后缀（如 com.cn、github.io、com）时，不允许当作父域使用 */
+  function isPublicSuffix(domain) {
+    const parts = String(domain || '').toLowerCase().split('.');
+    if (parts.length <= 1) return true;
+    if (parts.length === 2 && MULTI_LEVEL_SUFFIXES.has(parts.join('.'))) return true;
+    return false;
+  }
+
+  /** 注册域（可注册的最短域）：www.a.example.com → example.com；a.foo.com.cn → foo.com.cn */
+  function registrableDomain(host) {
+    const h = String(host || '').toLowerCase().replace(/\.$/, '');
+    if (!h || isIpHost(h)) return '';
+    const parts = h.split('.');
+    if (parts.length < 2) return '';
+    const suffixLen = MULTI_LEVEL_SUFFIXES.has(parts.slice(-2).join('.')) ? 2 : 1;
+    if (parts.length <= suffixLen) return '';
+    return parts.slice(-(suffixLen + 1)).join('.');
+  }
+
+  /** 由当前主机名逐级向上列出候选域，**到注册域为止**：www.a.example.com → a.example.com → example.com */
+  function candidateDomains(hostname) {
+    const host = String(hostname === undefined ? location.hostname : hostname || '')
+      .toLowerCase()
+      .replace(/\.$/, '');
     if (!host) return [];
-    // IP / IPv6 不做父域推断
-    if (/^\d+(\.\d+){3}$/.test(host) || host.includes(':')) return [];
-    const parts = host.split('.');
+    if (isIpHost(host)) return []; // IP / IPv6 不做父域推断
+    const reg = registrableDomain(host);
+    if (!reg) return [];
     const out = [];
-    for (let i = 0; i <= parts.length - 2 && out.length < 4; i++) {
+    const parts = host.split('.');
+    const regLen = reg.split('.').length;
+    for (let i = 0; i <= parts.length - regLen && out.length < 4; i++) {
       out.push(parts.slice(i).join('.'));
     }
     return out;
+  }
+
+  /**
+   * Cookie 是否真的属于当前主机（按浏览器的域匹配规则）：
+   *   - hostOnly 为 true：只能精确等于当前主机；
+   *   - 其余：`h === d` 或 `h.endsWith('.' + d)`；
+   *   - 并且 d 不得越过注册域（`github.io`、`com.cn` 这类公共后缀不算父域）。
+   */
+  function cookieMatchesHost(cookie, hostname) {
+    const h = String(hostname || '').toLowerCase().replace(/\.$/, '');
+    const c = cookie && typeof cookie === 'object' ? cookie : {};
+    const d = String(c.domain || h)
+      .toLowerCase()
+      .replace(/^\./, '')
+      .replace(/\.$/, '');
+    if (!h || !d) return false;
+    if (c.hostOnly === true) return h === d;
+    if (h === d) return true;
+    if (!h.endsWith('.' + d)) return false;
+    if (isPublicSuffix(d)) return false;
+    const reg = registrableDomain(h);
+    return !!reg && (d === reg || d.endsWith('.' + reg));
   }
 
   /**
@@ -293,11 +362,14 @@
    * 也不在 { domain: www.example.com } 的结果里。
    *
    * 因此这里不是「取到就停」，而是把 {url} 与各级父域 {domain} 的结果**全部合并去重**。
+   * 父域查询只到注册域为止，并且结果会按浏览器的 Cookie 域匹配规则再过滤一遍
+   * （{domain: example.com} 会连带返回 other.example.com 的 Cookie，这些不属于当前站点）。
    */
   async function collectCookies() {
     const merged = new Map();
     const sources = [];
     let gmUsable = false;
+    let filtered = 0; // 被域匹配规则剔除的条数（同一条被多次查询到会重复计数）
 
     const queries = [[{ url: location.href }, 'GM_cookie(url)']];
     for (const d of candidateDomains()) {
@@ -311,9 +383,18 @@
       if (list.length) sources.push(`${tag}=${list.length}`);
       for (const raw of list) {
         const c = normalizeCookie(raw);
+        // 按域匹配规则过滤：父域查询会连带返回兄弟子域的 Cookie，这些不属于当前站点
+        if (!cookieMatchesHost(c, location.hostname)) {
+          filtered++;
+          continue;
+        }
         const key = cookieKey(c);
         if (!merged.has(key)) merged.set(key, c); // 同一 Cookie 被多次查到只留一条
       }
+    }
+    if (filtered) {
+      sources.push(`filtered=${filtered}`);
+      dbg(`按域匹配规则过滤掉 ${filtered} 条不属于 ${location.hostname} 的 Cookie`);
     }
 
     if (gmUsable) {
@@ -407,7 +488,7 @@
     box.style.cssText =
       'position:fixed;z-index:2147483647;top:16px;left:50%;transform:translateX(-50%);pointer-events:none;';
     document.body.appendChild(box);
-    const root = box.attachShadow({ mode: 'open' });
+    const root = box.attachShadow({ mode: 'closed' }); // closed：页面脚本拿不到 box.shadowRoot
     applyStyles(root, TOAST_CSS);
     root.appendChild(mk('div', { class: 'wrap' }));
     // 注意：ShadowRoot.host 是只读属性，不能赋值，必须另存元素引用
@@ -633,6 +714,20 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
+  /**
+   * 只接受真实用户操作：页面脚本 dispatchEvent / el.click() 产生的事件 isTrusted=false。
+   */
+  function trusted(e) {
+    if (e && e.isTrusted === true) return true;
+    dbg('忽略非用户触发的事件：', e && e.type);
+    return false;
+  }
+
+  /** 「填入」只允许当前站点：凭据所属站点必须与当前页面主机名完全一致 */
+  function canFillOnThisPage(credHost) {
+    return String(credHost || '').toLowerCase() === String(location.hostname || '').toLowerCase();
+  }
+
   const isVisible = (el) => !!(el && el.offsetParent !== null);
 
   function fillLoginForm(username, password) {
@@ -820,11 +915,12 @@
         }),
 
         mk('label', { text: '鉴权令牌 X-Auth-Token（必填）' }),
+        // 令牌绝不回显到 DOM：输入框始终为空，留空保存 = 保留旧令牌
         mk('input', {
           type: 'password',
           id: 'token',
-          placeholder: '填写服务端 TOKEN',
-          value: cfg.authToken,
+          autocomplete: 'new-password',
+          placeholder: cfg.authToken ? '已保存（留空则保留原令牌）' : '填写服务端 TOKEN',
         }),
 
         mk('label', { class: 'chk' }, [
@@ -850,7 +946,7 @@
           '的凭据。内容以混淆形式存于本机油猴存储，非强加密。',
         ]),
 
-        mk('label', { text: '网站（默认当前站点）' }),
+        mk('label', { text: '网站（默认当前站点；「填入」只对当前站点生效）' }),
         mk('input', { type: 'text', id: 'v-host', value: location.hostname }),
 
         mk('label', { text: '账号 / 用户名' }),
@@ -893,7 +989,8 @@
       (pos ? `left:${pos.left}px;top:${pos.top}px;` : 'right:16px;bottom:16px;');
     document.body.appendChild(host);
 
-    const root = host.attachShadow({ mode: 'open' });
+    // closed：页面脚本无法通过 host.shadowRoot 读取面板里的地址、凭据列表，也无法操作按钮
+    const root = host.attachShadow({ mode: 'closed' });
     const cfg = getCfg();
 
     applyStyles(root, PANEL_CSS);
@@ -909,7 +1006,8 @@
     panelEl = panel;
 
     // ---- 收起面板（× 按钮）----
-    root.querySelector('#close').addEventListener('click', () => {
+    root.querySelector('#close').addEventListener('click', (e) => {
+      if (!trusted(e)) return;
       panel.classList.remove('open');
       forceShown = false;
       applyFloatVisibility();
@@ -917,7 +1015,11 @@
 
     // ---- 「在页面显示浮漂」开关 ----
     const floatChk = root.querySelector('#showfloat');
-    floatChk.addEventListener('change', () => {
+    floatChk.addEventListener('change', (e) => {
+      if (!trusted(e)) {
+        floatChk.checked = GM_getValue(K.showFloat, true); // 回滚非用户操作造成的勾选变化
+        return;
+      }
       GM_setValue(K.showFloat, floatChk.checked);
       forceShown = false;
       applyFloatVisibility();
@@ -939,6 +1041,7 @@
     let startTop = 0;
 
     btn.addEventListener('pointerdown', (e) => {
+      if (!trusted(e)) return;
       dragging = true;
       moved = false;
       startX = e.clientX;
@@ -958,7 +1061,7 @@
     });
 
     btn.addEventListener('pointermove', (e) => {
-      if (!dragging) return;
+      if (!dragging || !trusted(e)) return;
       const dx = e.clientX - startX;
       const dy = e.clientY - startY;
       if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
@@ -969,7 +1072,7 @@
     });
 
     const endDrag = (e) => {
-      if (!dragging) return;
+      if (!dragging || !trusted(e)) return;
       dragging = false;
       try {
         btn.releasePointerCapture(e.pointerId);
@@ -990,7 +1093,8 @@
 
     // ---- 标签切换 ----
     root.querySelectorAll('.tabs button').forEach((b) => {
-      b.addEventListener('click', () => {
+      b.addEventListener('click', (e) => {
+        if (!trusted(e)) return;
         root.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('active', x === b));
         root.querySelectorAll('.tab').forEach((t) =>
           t.classList.toggle('active', t.dataset.tab === b.dataset.tab)
@@ -999,20 +1103,27 @@
     });
 
     // ---- Cookie 标签 ----
-    root.querySelector('#save').addEventListener('click', () => {
+    root.querySelector('#save').addEventListener('click', (e) => {
+      if (!trusted(e)) return;
       GM_setValue(K.serverUrl, root.querySelector('#url').value.trim());
-      GM_setValue(K.authToken, root.querySelector('#token').value.trim());
+      const tokenInput = root.querySelector('#token');
+      const newToken = tokenInput.value.trim();
+      if (newToken) GM_setValue(K.authToken, newToken); // 留空 = 保留旧令牌
+      tokenInput.value = ''; // 保存后立即清空，不在 DOM 中保留令牌
+      tokenInput.placeholder = getCfg().authToken ? '已保存（留空则保留原令牌）' : '填写服务端 TOKEN';
       GM_setValue(K.autoExport, root.querySelector('#auto').checked);
       log('配置已保存', true);
       toast('配置已保存', 'ok');
     });
 
-    root.querySelector('#now').addEventListener('click', () => {
+    root.querySelector('#now').addEventListener('click', (e) => {
+      if (!trusted(e)) return;
       log('开始导出…');
       runExport({ silent: false });
     });
 
-    root.querySelector('#restore').addEventListener('click', () => {
+    root.querySelector('#restore').addEventListener('click', (e) => {
+      if (!trusted(e)) return;
       log('开始从服务器恢复…');
       runRestore();
     });
@@ -1025,7 +1136,8 @@
       note: root.querySelector('#v-note').value.trim(),
     });
 
-    root.querySelector('#v-save').addEventListener('click', () => {
+    root.querySelector('#v-save').addEventListener('click', (e) => {
+      if (!trusted(e)) return;
       const { host, username, password, note } = vaultInputs();
       if (!username || !password) {
         log('账号和密码不能为空', false);
@@ -1039,7 +1151,8 @@
       refreshVaultList();
     });
 
-    root.querySelector('#v-upload').addEventListener('click', async () => {
+    root.querySelector('#v-upload').addEventListener('click', async (e) => {
+      if (!trusted(e)) return;
       const { host, username, password, note } = vaultInputs();
       if (!username || !password) {
         toast('账号和密码不能为空', 'err');
@@ -1087,8 +1200,25 @@
 
         const fillBtn = document.createElement('button');
         fillBtn.textContent = '填入';
-        fillBtn.addEventListener('click', () => {
-          const r = fillLoginForm(entry.username, entry.password);
+        if (!canFillOnThisPage(host)) {
+          fillBtn.disabled = true;
+          fillBtn.title = '只能在该站点页面上填入';
+        }
+        fillBtn.addEventListener('click', (e) => {
+          if (!trusted(e)) return;
+          // 只允许把「当前站点」的凭据填进当前页面，防止页面改 #v-host 骗取别站密码
+          if (!canFillOnThisPage(host)) {
+            const msg = `只能在 ${host} 上填入该站点的凭据（当前页面：${location.hostname}）`;
+            log(msg, false);
+            toast(msg, 'err');
+            return;
+          }
+          const fresh = (getVault()[location.hostname] || []).find((x) => x.username === entry.username);
+          if (!fresh) {
+            toast('凭据已不存在，请刷新列表', 'err');
+            return;
+          }
+          const r = fillLoginForm(fresh.username, fresh.password);
           const ok = r.pwd || r.user;
           const msg = ok
             ? `已填入表单（账号:${r.user ? '✓' : '✗'} 密码:${r.pwd ? '✓' : '✗'}），请自行点击登录`
@@ -1099,7 +1229,8 @@
 
         const delBtn = document.createElement('button');
         delBtn.textContent = '删除';
-        delBtn.addEventListener('click', () => {
+        delBtn.addEventListener('click', (e) => {
+          if (!trusted(e)) return;
           deleteCredential(host, entry.username);
           log(`已删除凭据：${entry.username}`, true);
           toast(`已删除凭据：${entry.username}`, 'ok');
@@ -1112,7 +1243,10 @@
     }
 
     refreshVaultList = renderList;
-    root.querySelector('#v-host').addEventListener('input', renderList);
+    root.querySelector('#v-host').addEventListener('input', (e) => {
+      if (!trusted(e)) return;
+      renderList();
+    });
     renderList();
 
     try {
